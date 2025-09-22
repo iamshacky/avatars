@@ -1,0 +1,115 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Avatar Viewer</title>
+<style>
+  #face { width: 240px; height: 240px; border-radius: 50%; background: #eee;
+          display: flex; align-items: center; justify-content: center; margin: 24px auto; }
+  #mouth { width: 64px; height: 12px; border-radius: 8px; background: #333;
+          transition: height 60ms; }
+  body { font-family: sans-serif; max-width: 720px; margin: 20px auto; }
+  label,input,button { font-size: 16px; }
+</style>
+<body>
+  <h1>Avatar Viewer</h1>
+
+  <div>
+    <label>Room: <input id="room" value="demo"></label>
+    <label>User: <input id="user" value="viewer"></label>
+    <button id="joinBtn">Join</button>
+  </div>
+
+  <div id="face"><div id="mouth"></div></div>
+  <audio id="audio" autoplay></audio>
+
+  <div>
+    <textarea id="msg" rows="3" style="width:100%;">Say hello to everyone.</textarea>
+    <div style="margin-top:8px;">
+      <button id="speakOnce">Speak (transient)</button>
+      <button id="stayJoin">Join (persistent)</button>
+      <button id="staySpeak">Speak (persistent)</button>
+      <button id="stayLeave">Leave</button>
+    </div>
+  </div>
+
+  <script type="module">
+    import { Room, RoomEvent } from "https://cdn.skypack.dev/livekit-client";
+
+    const audioEl = document.getElementById("audio");
+    const mouthEl = document.getElementById("mouth");
+    const roomInput = document.getElementById("room");
+    const userInput = document.getElementById("user");
+
+    let room;
+
+    async function getClientToken(roomName, userName) {
+      const r = await fetch(`${BOT_BASE}/token?room=${encodeURIComponent(roomName)}&user=${encodeURIComponent(userName)}`);
+      if (!r.ok) throw new Error("token fetch failed");
+      return r.text();
+    }
+
+    async function connect() {
+      const roomName = roomInput.value;
+      const userName = userInput.value;
+      const token = await getClientToken(roomName, userName);
+      room = new Room();
+      await room.connect("wss://project1-5bgowgi3.livekit.cloud", token);
+
+      room.on(RoomEvent.TrackSubscribed, (_track, pub) => {
+        if (pub.kind === "audio") {
+          const mediaStream = new MediaStream([pub.track.mediaStreamTrack]);
+          audioEl.srcObject = mediaStream;
+          animateMouth(mediaStream);
+        }
+      });
+    }
+
+    function animateMouth(stream) {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      function tick() {
+        analyser.getByteFrequencyData(data);
+        let level = 0;
+        for (let i = 0; i < data.length; i++) level += data[i];
+        level = level / data.length;
+        const h = 10 + Math.min(90, level / 2.5);
+        mouthEl.style.height = h + "px";
+        requestAnimationFrame(tick);
+      }
+      tick();
+    }
+
+    document.getElementById("joinBtn").onclick = connect;
+
+    // Helpers: change these URLs to your deployed Railway URL for the bot
+    const BOT_BASE = "https://<your-avatarbot-service>.up.railway.app"; // replace with https://avatarbot-<railway>.up.railway.app
+
+    async function postJSON(path, body) {
+      const r = await fetch(BOT_BASE + path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      return r.json();
+    }
+
+    document.getElementById("speakOnce").onclick = () => {
+      const roomName = roomInput.value;
+      const text = document.getElementById("msg").value;
+      postJSON("/message", { roomName, text, keep: false });
+    };
+    document.getElementById("stayJoin").onclick = () => {
+      const roomName = roomInput.value;
+      postJSON("/join", { roomName });
+    };
+    document.getElementById("staySpeak").onclick = () => {
+      const roomName = roomInput.value;
+      const text = document.getElementById("msg").value;
+      postJSON("/message", { roomName, text, keep: true });
+    };
+    document.getElementById("stayLeave").onclick = () => postJSON("/leave", {});
+  </script>
+</body>
