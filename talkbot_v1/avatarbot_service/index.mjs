@@ -143,7 +143,13 @@ app.post("/message", async (req, res) => {
     : (process.env.BOT_MODE || BOT_MODE);
 
   try {
-    const reply = await llmReply(textIn);
+    const reply = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are AvatarBot: concise, friendly, YouTube-presenter energy. Keep answers under 15 seconds unless asked." },
+        { role: "user", content: userText }  // or text
+      ]
+    });
 
     if (mode === "PERSISTENT") {
       if (!persistent?.room) {
