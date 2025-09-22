@@ -8,11 +8,11 @@
   },
   "dependencies": {
     "@livekit/agents": "^0.7.0",
+    "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "livekit-server-sdk": "^2.3.3",
     "node-fetch": "^3.3.2",
-    "cors": "^2.8.5",
     "openai": "^4.59.0"
   }
 }

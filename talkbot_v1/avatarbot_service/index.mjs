@@ -1,15 +1,12 @@
 import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
+import cors from "cors";
+import { AccessToken } from "livekit-server-sdk";
+import OpenAI from "openai";
 
 // LiveKit Agents SDK
 import { Room, trackFromFile } from "@livekit/agents";
-import { OpenAI } from "@livekit/agents-plugin-openai";
-
-import cors from "cors";
-import { AccessToken } from "livekit-server-sdk";
-
-app.use(cors()); // allow all origins for now; lock this down later if you like
 
 const {
   LIVEKIT_URL,
@@ -36,6 +33,7 @@ if (!PIPER_URL) {
 }
 
 const app = express();
+app.use(cors()); // allow all origins for now; lock this down later if you like
 app.use(express.json());
 
 let persistent = null; // { room: Room } when connected persistently
@@ -47,11 +45,7 @@ async function connectToRoom(roomName, identity = BOT_IDENTITY) {
     apiKey: LIVEKIT_API_KEY,
     apiSecret: LIVEKIT_API_SECRET,
     identity,
-    // if you wish to pin to a room when connecting via Agents SDK:
-    // NOTE: some versions join using server API; this identity will appear in that room on publish.
   });
-  // If a specific room name is required by your LiveKit Cloud project routing,
-  // you can keep DEFAULT_ROOM as a convention for your environment/workflow.
   return room;
 }
 
@@ -69,20 +63,21 @@ async function speakTextIntoRoom(room, text) {
   const track = await trackFromFile(wavBuf, { mimeType: "audio/wav" });
   await room.localParticipant.publishTrack(track, { name: "avatar-audio" });
 
-  // Allow pipeline to flush slightly
+  // Let the pipeline flush
   await new Promise(r => setTimeout(r, 500));
 }
 
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
 async function llmReply(userText) {
-  const client = new OpenAI({ apiKey: OPENAI_API_KEY });
-  const res = await client.chat.completions.create({
+  const res = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [
       { role: "system", content: "You are AvatarBot: concise, friendly, YouTube-presenter energy. Keep answers under 15 seconds unless asked." },
       { role: "user", content: userText }
     ]
   });
-  return res.choices[0].message.content;
+  return res.choices?.[0]?.message?.content ?? "Sorry, I couldn't think of anything to say.";
 }
 
 // ---- HTTP Endpoints ----
@@ -143,13 +138,7 @@ app.post("/message", async (req, res) => {
     : (process.env.BOT_MODE || BOT_MODE);
 
   try {
-    const reply = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "You are AvatarBot: concise, friendly, YouTube-presenter energy. Keep answers under 15 seconds unless asked." },
-        { role: "user", content: userText }  // or text
-      ]
-    });
+    const reply = await llmReply(textIn);
 
     if (mode === "PERSISTENT") {
       if (!persistent?.room) {
@@ -170,6 +159,7 @@ app.post("/message", async (req, res) => {
   }
 });
 
+// Client token endpoint
 app.get("/token", async (req, res) => {
   try {
     const roomName = String(req.query.room || process.env.DEFAULT_ROOM || "demo");
