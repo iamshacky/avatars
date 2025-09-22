@@ -2,11 +2,11 @@ import "dotenv/config";
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
-import { AccessToken } from "livekit-server-sdk";
 import OpenAI from "openai";
+import { AccessToken } from "livekit-server-sdk";
 
-// LiveKit Agents SDK
-import { Room, trackFromFile } from "@livekit/agents";
+// Server-side WebRTC client for LiveKit
+import { Room, LocalAudioTrack, WavFileSource } from "@livekit/rtc-node";
 
 const {
   LIVEKIT_URL,
@@ -33,24 +33,36 @@ if (!PIPER_URL) {
 }
 
 const app = express();
-app.use(cors()); // allow all origins for now; lock this down later if you like
+app.use(cors());
 app.use(express.json());
 
-let persistent = null; // { room: Room } when connected persistently
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+let persistent = null; // { room: Room, identity: string, roomName: string }
+
+function mintServerToken({ roomName, identity, canPublish = true }) {
+  const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+    identity,
+    ttl: "60m",
+  });
+  at.addGrant({
+    roomJoin: true,
+    room: roomName,
+    canPublish,
+    canSubscribe: true,
+  });
+  return at.toJwt();
+}
 
 async function connectToRoom(roomName, identity = BOT_IDENTITY) {
   const room = new Room();
-  await room.connect(LIVEKIT_URL, {
-    autoSubscribe: false,
-    apiKey: LIVEKIT_API_KEY,
-    apiSecret: LIVEKIT_API_SECRET,
-    identity,
-  });
+  const token = await mintServerToken({ roomName, identity, canPublish: true });
+  await room.connect(LIVEKIT_URL, await token);
   return room;
 }
 
 async function speakTextIntoRoom(room, text) {
-  // 1) TTS to WAV
+  // 1) TTS to WAV (buffer)
   const tts = await fetch(`${PIPER_URL}/synthesize`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -59,15 +71,24 @@ async function speakTextIntoRoom(room, text) {
   if (!tts.ok) throw new Error(`Piper error: ${tts.status}`);
   const wavBuf = Buffer.from(await tts.arrayBuffer());
 
-  // 2) Publish audio track
-  const track = await trackFromFile(wavBuf, { mimeType: "audio/wav" });
-  await room.localParticipant.publishTrack(track, { name: "avatar-audio" });
+  // 2) Save to temp .wav (WavFileSource expects a file path)
+  const tmp = await import("tmp");
+  const tmpFile = tmp.fileSync({ postfix: ".wav" });
+  await import("fs").then(({ writeFileSync }) => writeFileSync(tmpFile.name, wavBuf));
 
-  // Let the pipeline flush
-  await new Promise(r => setTimeout(r, 500));
+  // 3) Create audio source & track, publish
+  const source = await WavFileSource.fromFile(tmpFile.name);
+  const track = LocalAudioTrack.createAudioTrack("avatar-audio", {
+    source, // feed WAV frames into the track
+  });
+  await room.localParticipant.publishTrack(track);
+
+  // Let audio pipeline flush a bit
+  await new Promise((r) => setTimeout(r, 500));
+
+  // Cleanup temp file
+  tmpFile.removeCallback?.();
 }
-
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 async function llmReply(userText) {
   const res = await openai.chat.completions.create({
@@ -82,10 +103,10 @@ async function llmReply(userText) {
 
 // ---- HTTP Endpoints ----
 
-// Health
-app.get("/healthz", (_, res) => res.json({ ok: true, mode: BOT_MODE, room: DEFAULT_ROOM }));
+app.get("/healthz", (_req, res) => {
+  res.json({ ok: true, mode: process.env.BOT_MODE || BOT_MODE, room: DEFAULT_ROOM });
+});
 
-// Toggle mode at runtime (optional)
 app.post("/mode", (req, res) => {
   const { mode } = req.body || {};
   if (mode && ["TRANSIENT", "PERSISTENT"].includes(mode)) {
@@ -96,15 +117,12 @@ app.post("/mode", (req, res) => {
   }
 });
 
-// Join/leave for persistent mode
 app.post("/join", async (req, res) => {
   const roomName = req.body?.roomName || DEFAULT_ROOM;
-  if (persistent?.room) {
-    return res.json({ ok: true, info: "already connected" });
-  }
+  if (persistent?.room) return res.json({ ok: true, info: "already connected" });
   try {
     const room = await connectToRoom(roomName);
-    persistent = { room };
+    persistent = { room, identity: BOT_IDENTITY, roomName };
     res.json({ ok: true, roomName });
   } catch (e) {
     console.error(e);
@@ -125,11 +143,10 @@ app.post("/leave", async (_req, res) => {
   }
 });
 
-// Main: send a message for the bot to say
 app.post("/message", async (req, res) => {
   const roomName = req.body?.roomName || DEFAULT_ROOM;
   const textIn = String(req.body?.text || "").trim();
-  const keep = req.body?.keep; // optional per-request override
+  const keep = req.body?.keep;
 
   if (!textIn) return res.status(400).json({ ok: false, error: "text required" });
 
@@ -143,7 +160,7 @@ app.post("/message", async (req, res) => {
     if (mode === "PERSISTENT") {
       if (!persistent?.room) {
         const room = await connectToRoom(roomName);
-        persistent = { room };
+        persistent = { room, identity: BOT_IDENTITY, roomName };
       }
       await speakTextIntoRoom(persistent.room, reply);
     } else {
@@ -159,14 +176,14 @@ app.post("/message", async (req, res) => {
   }
 });
 
-// Client token endpoint
+// Public client token for the viewer web page (subscribe-only)
 app.get("/token", async (req, res) => {
   try {
     const roomName = String(req.query.room || process.env.DEFAULT_ROOM || "demo");
     const identity = String(req.query.user || "viewer-" + Math.random().toString(36).slice(2, 8));
     const ttlMin = Number(process.env.CLIENT_TOKEN_TTL_MIN || 60);
 
-    const at = new AccessToken(process.env.LIVEKIT_API_KEY, process.env.LIVEKIT_API_SECRET, {
+    const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
       identity,
       ttl: `${ttlMin}m`,
     });
