@@ -4,9 +4,15 @@ import fetch from "node-fetch";
 import cors from "cors";
 import OpenAI from "openai";
 import { AccessToken } from "livekit-server-sdk";
-
-// Server-side WebRTC client for LiveKit
-import { Room, LocalAudioTrack, WavFileSource } from "@livekit/rtc-node";
+import {
+  Room,
+  AudioSource,
+  LocalAudioTrack,
+  TrackPublishOptions,
+  TrackSource,
+  AudioFrame,
+} from "@livekit/rtc-node";
+import { decode } from "wav-decoder";
 
 const {
   LIVEKIT_URL,
@@ -16,7 +22,7 @@ const {
   PIPER_URL,
   DEFAULT_ROOM = "demo",
   BOT_IDENTITY = "AvatarBot",
-  BOT_MODE = "TRANSIENT" // or PERSISTENT
+  BOT_MODE = "TRANSIENT", // or PERSISTENT
 } = process.env;
 
 if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
@@ -38,7 +44,7 @@ app.use(express.json());
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-let persistent = null; // { room: Room, identity: string, roomName: string }
+let persistent = null; // { room: Room, roomName: string }
 
 function mintServerToken({ roomName, identity, canPublish = true }) {
   const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
@@ -61,33 +67,74 @@ async function connectToRoom(roomName, identity = BOT_IDENTITY) {
   return room;
 }
 
+async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
+  // decode WAV -> Float32 PCM
+  const { sampleRate, channelData } = await decode(wavBuf);
+  const channels = channelData.length;
+  const ch0 = channelData[0]; // Float32Array [-1,1]
+  // For mono, great; if stereo, downmix simple average for now
+  let mono;
+  if (channels === 1) {
+    mono = ch0;
+  } else {
+    const len = channelData[0].length;
+    mono = new Float32Array(len);
+    for (let i = 0; i < len; i++) {
+      let acc = 0;
+      for (let c = 0; c < channels; c++) acc += channelData[c][i];
+      mono[i] = acc / channels;
+    }
+  }
+
+  // convert to int16
+  const pcm16 = new Int16Array(mono.length);
+  for (let i = 0; i < mono.length; i++) {
+    const s = Math.max(-1, Math.min(1, mono[i]));
+    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+
+  // split into 20ms frames (or desiredFrameMs)
+  const samplesPerFrame = Math.floor((sampleRate * desiredFrameMs) / 1000);
+  const frames = [];
+  for (let offset = 0; offset < pcm16.length; offset += samplesPerFrame) {
+    const slice = pcm16.subarray(offset, Math.min(offset + samplesPerFrame, pcm16.length));
+    // AudioFrame expects interleaved int16 bytes (num_channels=1 here)
+    const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+    frames.push({ buf, sampleRate, samplesPerChannel: slice.length, numChannels: 1 });
+  }
+  return { frames, sampleRate, channels: 1 };
+}
+
 async function speakTextIntoRoom(room, text) {
-  // 1) TTS to WAV (buffer)
+  // 1) Get WAV from Piper
   const tts = await fetch(`${PIPER_URL}/synthesize`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text })
+    body: JSON.stringify({ text }),
   });
   if (!tts.ok) throw new Error(`Piper error: ${tts.status}`);
   const wavBuf = Buffer.from(await tts.arrayBuffer());
 
-  // 2) Save to temp .wav (WavFileSource expects a file path)
-  const tmp = await import("tmp");
-  const tmpFile = tmp.fileSync({ postfix: ".wav" });
-  await import("fs").then(({ writeFileSync }) => writeFileSync(tmpFile.name, wavBuf));
+  // 2) Decode to PCM frames
+  const { frames, sampleRate } = await wavToInt16Frames(wavBuf, 20);
 
-  // 3) Create audio source & track, publish
-  const source = await WavFileSource.fromFile(tmpFile.name);
-  const track = LocalAudioTrack.createAudioTrack("avatar-audio", {
-    source, // feed WAV frames into the track
-  });
-  await room.localParticipant.publishTrack(track);
+  // 3) Create AudioSource/Track and publish
+  const source = new AudioSource(sampleRate, 1);
+  const track = LocalAudioTrack.createAudioTrack("avatar-audio", source);
+  const options = new TrackPublishOptions();
+  options.source = TrackSource.SOURCE_MICROPHONE;
 
-  // Let audio pipeline flush a bit
-  await new Promise((r) => setTimeout(r, 500));
+  await room.localParticipant.publishTrack(track, options);
 
-  // Cleanup temp file
-  tmpFile.removeCallback?.();
+  // 4) Push frames (blocking until queued)
+  for (const f of frames) {
+    const frame = new AudioFrame(f.buf, f.sampleRate, f.numChannels, f.samplesPerChannel);
+    await source.captureFrame(frame);
+  }
+
+  // tiny drain
+  await new Promise((r) => setTimeout(r, 200));
+  await track.close(); // unpublish the temp track for transient speech
 }
 
 async function llmReply(userText) {
@@ -95,8 +142,8 @@ async function llmReply(userText) {
     model: "gpt-4o-mini",
     messages: [
       { role: "system", content: "You are AvatarBot: concise, friendly, YouTube-presenter energy. Keep answers under 15 seconds unless asked." },
-      { role: "user", content: userText }
-    ]
+      { role: "user", content: userText },
+    ],
   });
   return res.choices?.[0]?.message?.content ?? "Sorry, I couldn't think of anything to say.";
 }
@@ -122,7 +169,7 @@ app.post("/join", async (req, res) => {
   if (persistent?.room) return res.json({ ok: true, info: "already connected" });
   try {
     const room = await connectToRoom(roomName);
-    persistent = { room, identity: BOT_IDENTITY, roomName };
+    persistent = { room, roomName };
     res.json({ ok: true, roomName });
   } catch (e) {
     console.error(e);
@@ -150,9 +197,7 @@ app.post("/message", async (req, res) => {
 
   if (!textIn) return res.status(400).json({ ok: false, error: "text required" });
 
-  const mode = (keep === true || keep === false)
-    ? (keep ? "PERSISTENT" : "TRANSIENT")
-    : (process.env.BOT_MODE || BOT_MODE);
+  const mode = keep === true || keep === false ? (keep ? "PERSISTENT" : "TRANSIENT") : (process.env.BOT_MODE || BOT_MODE);
 
   try {
     const reply = await llmReply(textIn);
@@ -160,7 +205,7 @@ app.post("/message", async (req, res) => {
     if (mode === "PERSISTENT") {
       if (!persistent?.room) {
         const room = await connectToRoom(roomName);
-        persistent = { room, identity: BOT_IDENTITY, roomName };
+        persistent = { room, roomName };
       }
       await speakTextIntoRoom(persistent.room, reply);
     } else {
@@ -176,7 +221,7 @@ app.post("/message", async (req, res) => {
   }
 });
 
-// Public client token for the viewer web page (subscribe-only)
+// Viewer token (subscribe-only)
 app.get("/token", async (req, res) => {
   try {
     const roomName = String(req.query.room || process.env.DEFAULT_ROOM || "demo");
@@ -190,7 +235,7 @@ app.get("/token", async (req, res) => {
     at.addGrant({
       roomJoin: true,
       room: roomName,
-      canPublish: false,   // viewer page subscribes only
+      canPublish: false,
       canSubscribe: true,
     });
     const jwt = await at.toJwt();
