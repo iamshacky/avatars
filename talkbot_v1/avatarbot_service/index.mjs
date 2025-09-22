@@ -12,7 +12,8 @@ import {
   TrackSource,
   AudioFrame,
 } from "@livekit/rtc-node";
-import { decode } from "wav-decoder";
+// import { decode } from "wav-decoder";
+import { decode } from "node-wav";
 
 const {
   LIVEKIT_URL,
