@@ -84,8 +84,8 @@
 
     document.getElementById("joinBtn").onclick = connect;
 
-    // Helpers: change these URLs to your deployed Railway URL for the bot
-    const BOT_BASE = "https://<your-avatarbot-service>.up.railway.app"; // replace with https://avatarbot-<railway>.up.railway.app
+    // Helpers: Deployed Railway URL for the bot
+    const BOT_BASE = "https://exciting-nourishment-production.up.railway.app";
 
     async function postJSON(path, body) {
       const r = await fetch(BOT_BASE + path, {
