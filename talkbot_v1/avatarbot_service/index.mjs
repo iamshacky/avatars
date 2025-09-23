@@ -40,8 +40,44 @@ if (!PIPER_URL) {
 }
 
 const app = express();
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+//app.use(express.static(path.join(__dirname, "public")));
+
+// (optional) serve it at the root path too
+/*
+app.get("/", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+*/
+
+//app.use(express.static("public"));
+//app.use(cors());
+//app.use(express.json());
+
+
 app.use(cors());
 app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
+
+
+
+// 🔐 simple shared-secret gate for write endpoints
+app.use((req, res, next) => {
+  const needsAuth =
+    req.method === "POST" &&
+    ["/message", "/join", "/leave", "/mode"].includes(req.path);
+  if (!needsAuth) return next();
+
+  const provided = req.headers["x-bot-auth"];
+  if (!process.env.BOT_AUTH || provided === process.env.BOT_AUTH) return next();
+
+  return res.status(401).json({ ok: false, error: "unauthorized" });
+});
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
@@ -61,11 +97,30 @@ function mintServerToken({ roomName, identity, canPublish = true }) {
   return at.toJwt();
 }
 
+/*
 async function connectToRoom(roomName, identity = BOT_IDENTITY) {
   const room = new Room();
   const token = await mintServerToken({ roomName, identity, canPublish: true });
   await room.connect(LIVEKIT_URL, await token);
   return room;
+}
+*/
+async function connectToRoom(roomName, identity = BOT_IDENTITY) {
+  const room = new Room();
+  const token = await mintServerToken({ roomName, identity, canPublish: true });
+  try {
+    await room.connect(LIVEKIT_URL, token);
+    return room;
+  } catch (e) {
+    console.error("LiveKit connect failed", {
+      url: LIVEKIT_URL,
+      roomName,
+      identity,
+      iss: (process.env.LIVEKIT_API_KEY || "").slice(0, 4) + "…",
+      msg: String(e)
+    });
+    throw e;
+  }
 }
 
 async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
@@ -244,6 +299,28 @@ app.get("/token", async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: "token error" });
+  }
+});
+
+// 🔎 Piper health passthrough
+app.get("/diag/piper", async (_req, res) => {
+  try {
+    const r = await fetch(`${PIPER_URL}/healthz`);
+    res.json({ ok: r.ok, status: r.status });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// 🔎 LiveKit connect-only check
+app.get("/diag/connect", async (_req, res) => {
+  try {
+    const room = await connectToRoom(process.env.DEFAULT_ROOM || "demo");
+    await room.disconnect();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
