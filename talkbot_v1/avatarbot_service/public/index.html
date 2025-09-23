@@ -32,8 +32,10 @@
   </div>
 
   <script type="module">
-    import { Room, RoomEvent } from "https://cdn.skypack.dev/livekit-client";
+    // LiveKit client (pin to v2 on jsDelivr)
+    import { Room, RoomEvent } from "https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.esm.min.js";
 
+    // ---- elements ----
     const audioEl = document.getElementById("audio");
     const mouthEl = document.getElementById("mouth");
     const roomInput = document.getElementById("room");
@@ -47,47 +49,34 @@
     // If you didn't enable it, leave it empty "".
     const BOT_AUTH = ""; // e.g. "my-long-shared-secret"
 
+    // ---- resilient autoplay / unmute ----
+    const clickToUnmute = () => {
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) {
+          const ctx = new AC();
+          ctx.resume().catch(()=>{});
+        }
+      } catch {}
+      audioEl.muted = false;
+      audioEl.play().catch(e => console.warn("audioEl.play() blocked:", e?.message || e));
+    };
+    // one-time global click to ensure audio can play
+    window.addEventListener('click', clickToUnmute, { once: true });
+
+    audioEl.addEventListener('play', () => console.log('[audio] playing'));
+    audioEl.addEventListener('error', (e) => console.warn('[audio] error', e));
+
+    // ---- helpers ----
     async function getClientToken(roomName, userName) {
       const r = await fetch(`${BOT_BASE}/token?room=${encodeURIComponent(roomName)}&user=${encodeURIComponent(userName)}`);
       if (!r.ok) throw new Error("token fetch failed");
       return r.text();
     }
 
-    async function connect() {
-      const roomName = roomInput.value || "default";
-      const userName = userInput.value || ("viewer-" + Math.random().toString(36).slice(2,8));
-      const token = await getClientToken(roomName, userName);
-
-      room = new Room();
-      await room.connect("wss://project1-5bgowgi3.livekit.cloud", token);
-      console.log("Viewer connected. my identity:", room.localParticipant?.identity);
-      room.participants.forEach((p) => console.log("Existing participant:", p.identity));
-
-      room.on(RoomEvent.TrackSubscribed, (_track, pub, participant) => {
-        if (pub.kind === "audio") {
-          console.log("Subscribed to audio from:", participant.identity, pub.trackSid || pub.sid || pub.trackName);
-          const mediaStream = new MediaStream([pub.track.mediaStreamTrack]);
-          audioEl.srcObject = mediaStream;
-          audioEl.muted = false;
-          audioEl.play().then(() => {
-            console.log("audioEl.play() resolved");
-          }).catch((e) => {
-            console.warn("audioEl.play() blocked or failed:", e);
-          });
-          animateMouth(mediaStream);
-        }
-      });
-
-      room.on(RoomEvent.ParticipantConnected, (p) => {
-        console.log("Participant connected:", p.identity);
-      });
-      room.on(RoomEvent.ParticipantDisconnected, (p) => {
-        console.log("Participant disconnected:", p.identity);
-      });
-    }
-
     function animateMouth(stream) {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AC();
       const src = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
@@ -105,9 +94,44 @@
       tick();
     }
 
+    async function connect() {
+      const roomName = roomInput.value || "default";
+      const userName = userInput.value || ("viewer-" + Math.random().toString(36).slice(2,8));
+      const token = await getClientToken(roomName, userName);
+
+      room = new Room();
+
+      // helpful connection logs
+      room.on(RoomEvent.ConnectionStateChanged, (s) => console.log("[LK] ConnectionState:", s));
+      room.on(RoomEvent.ParticipantConnected, (p) => console.log("[LK] Participant+", p.identity));
+      room.on(RoomEvent.ParticipantDisconnected, (p) => console.log("[LK] Participant-", p.identity));
+
+      room.on(RoomEvent.TrackSubscribed, (_track, pub, participant) => {
+        if (pub.kind === "audio") {
+          console.log("[LK] TrackSubscribed (audio) from", participant.identity, pub.trackSid || pub.sid || pub.trackName);
+          const mediaStream = new MediaStream([pub.track.mediaStreamTrack]);
+          audioEl.srcObject = mediaStream;
+          audioEl.muted = false;
+          // try to play immediately and again after a user gesture if needed
+          audioEl.play().then(() => {
+            console.log("[audio] play() resolved after subscribe");
+          }).catch((e) => {
+            console.warn("[audio] play() blocked:", e?.message || e);
+          });
+          animateMouth(mediaStream);
+        }
+      });
+
+      await room.connect("wss://project1-5bgowgi3.livekit.cloud", token);
+      console.log("Viewer connected. my identity:", room.localParticipant?.identity);
+
+      // log any existing participants (helps confirm join order)
+      room.participants.forEach((p) => console.log("[LK] Existing participant:", p.identity));
+    }
+
+    // ---- wiring ----
     document.getElementById("joinBtn").onclick = connect;
 
-    // ---- shared POST helper (now with optional auth + better errors) ----
     async function postJSON(path, body) {
       const headers = { "content-type": "application/json" };
       if (BOT_AUTH) headers["x-bot-auth"] = BOT_AUTH;
@@ -130,11 +154,10 @@
       return json ?? {};
     }
 
-    // buttons → API
     document.getElementById("speakOnce").onclick = async () => {
       try {
         const roomName = roomInput.value || "default";
-        const text = document.getElementById("msg").value || "Hello from AvatarBot!";
+        const text = document.getElementById("msg").value || "Hello from AvatarBot_1!";
         const res = await postJSON("/message", { roomName, text, keep: false });
         console.log("speakOnce ok", res);
       } catch (e) {
@@ -176,5 +199,4 @@
       }
     };
   </script>
-
 </body>

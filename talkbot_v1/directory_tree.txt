@@ -1,0 +1,17 @@
+c/xampp/htdocs/project1/avatars
+.
+|____.gitignore
+|____gitignore
+|____README.md
+|____talkbot_v1
+| |____avatarbot_service
+| | |____.env
+| | |____.env.example
+| | |____index.mjs
+| | |____package.json
+| | |____public
+| | | |____index.html
+| | |____README.md
+| |____piper_service
+| | |____app.py
+| | |____Dockerfile
