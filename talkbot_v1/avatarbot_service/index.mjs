@@ -12,17 +12,21 @@ import {
   TrackSource,
   AudioFrame,
 } from "@livekit/rtc-node";
-// import { decode } from "wav-decoder";
 import { decode } from "node-wav";
 
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+// ── ENV ────────────────────────────────────────────────────────────────────────
 const {
   LIVEKIT_URL,
   LIVEKIT_API_KEY,
   LIVEKIT_API_SECRET,
   OPENAI_API_KEY,
   PIPER_URL,
-  DEFAULT_ROOM = "demo",
-  BOT_IDENTITY = "AvatarBot",
+  DEFAULT_ROOM = "default",
+  BOT_IDENTITY = "AvatarBot_1",
   BOT_MODE = "TRANSIENT", // or PERSISTENT
 } = process.env;
 
@@ -39,42 +43,37 @@ if (!PIPER_URL) {
   process.exit(1);
 }
 
+// ── APP & STATIC ──────────────────────────────────────────────────────────────
 const app = express();
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pubDir = path.join(__dirname, "public");
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
-app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
+app.use(express.static(pubDir));
+app.get("/", (_req, res) => res.sendFile(path.join(pubDir, "index.html")));
 
 app.get("/__debug/files", (_req, res) => {
-  let exists = fs.existsSync(pubDir);
-  let listing = exists ? fs.readdirSync(pubDir) : [];
+  const exists = fs.existsSync(pubDir);
+  const listing = exists ? fs.readdirSync(pubDir) : [];
   res.json({ __dirname, pubDir, exists, listing });
 });
 
-// 🔐 simple shared-secret gate for write endpoints
+// 🔐 shared-secret guard (optional)
 app.use((req, res, next) => {
   const needsAuth =
     req.method === "POST" &&
-    ["/message", "/join", "/leave", "/mode"].includes(req.path);
+    ["/message", "/join", "/leave", "/mode", "/diag/tone", "/diag/silence"].includes(req.path);
   if (!needsAuth) return next();
-
   const provided = req.headers["x-bot-auth"];
   if (!process.env.BOT_AUTH || provided === process.env.BOT_AUTH) return next();
-
   return res.status(401).json({ ok: false, error: "unauthorized" });
 });
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
 let persistent = null; // { room: Room, roomName: string }
 
+// ── LIVEKIT HELPERS ───────────────────────────────────────────────────────────
 function mintServerToken({ roomName, identity, canPublish = true }) {
   const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
     identity,
@@ -101,19 +100,50 @@ async function connectToRoom(roomName, identity = BOT_IDENTITY) {
       roomName,
       identity,
       iss: (process.env.LIVEKIT_API_KEY || "").slice(0, 4) + "…",
-      msg: String(e)
+      msg: String(e),
     });
     throw e;
   }
 }
 
+async function safeUnpublish(room, publication, track) {
+  // Try all known signatures across rtc-node variants.
+  const sid =
+    publication?.trackSid ??
+    publication?.sid ??
+    (typeof publication?.toJSON === "function" ? publication.toJSON()?.sid : undefined);
+
+  const attempts = [
+    () => sid && room.localParticipant.unpublishTrack(sid, { stopOnUnpublish: true }),
+    () => sid && room.localParticipant.unpublishTrack(sid, true),
+    () => room.localParticipant.unpublishTrack(track, { stopOnUnpublish: true }),
+    () => room.localParticipant.unpublishTrack(track, true),
+    () => publication && room.localParticipant.unpublishTrack(publication, { stopOnUnpublish: true }),
+  ];
+
+  let lastErr = null;
+  for (const fn of attempts) {
+    try {
+      const p = fn();
+      if (!p) continue;
+      await p;
+      console.log("unpublishTrack: success");
+      return;
+    } catch (e) {
+      lastErr = e;
+      console.warn("unpublishTrack signature failed:", e?.message || String(e));
+    }
+  }
+  console.warn("unpublishTrack: all signatures failed; continuing", lastErr?.message || lastErr);
+}
+
+// ── AUDIO: WAV → 48k PCM FRAMES ───────────────────────────────────────────────
 async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
-  // decode WAV -> Float32 PCM
   const { sampleRate: srcRate, channelData } = await decode(wavBuf);
   const channels = channelData.length;
-  const ch0 = channelData[0]; // Float32Array [-1, 1]
+  const ch0 = channelData[0];
 
-  // Downmix to mono if needed
+  // downmix to mono if needed
   let mono;
   if (channels === 1) {
     mono = ch0;
@@ -127,14 +157,14 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
     }
   }
 
-  // Convert float32 [-1,1] -> int16
+  // float32 → int16
   const pcm16src = new Int16Array(mono.length);
   for (let i = 0; i < mono.length; i++) {
     const s = Math.max(-1, Math.min(1, mono[i]));
     pcm16src[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
 
-  // ---- resample to 48kHz mono ----
+  // resample to 48 kHz
   const dstRate = 48000;
   let pcm16 = pcm16src;
   let rate = srcRate;
@@ -155,8 +185,8 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
     rate = dstRate;
   }
 
-  // Frame into 20 ms chunks at dstRate (48kHz → 960 samples per frame)
-  const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000);
+  // frame into 20ms chunks
+  const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000); // 960 @ 48kHz
   const frames = [];
   for (let offset = 0; offset < pcm16.length; offset += samplesPerFrame) {
     const slice = pcm16.subarray(offset, Math.min(offset + samplesPerFrame, pcm16.length));
@@ -166,8 +196,9 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
   return { frames, sampleRate: rate, channels: 1 };
 }
 
+// ── SPEAK: TTS → PUBLISH → DWELL → UNPUBLISH ─────────────────────────────────
 async function speakTextIntoRoom(room, text) {
-  // 1) Get WAV from Piper
+  // 1) Piper TTS to WAV
   const tts = await fetch(`${PIPER_URL}/synthesize`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -176,17 +207,16 @@ async function speakTextIntoRoom(room, text) {
   if (!tts.ok) throw new Error(`Piper error: ${tts.status}`);
   const wavBuf = Buffer.from(await tts.arrayBuffer());
 
-  // 2) Decode to PCM frames
+  // 2) Decode → 48k frames
   const { frames, sampleRate } = await wavToInt16Frames(wavBuf, 20);
 
-  // 3) Create AudioSource/Track and publish
+  // 3) Publish
   const source = new AudioSource(sampleRate, 1);
   const track = LocalAudioTrack.createAudioTrack("avatar-audio", source);
 
   const options = new TrackPublishOptions();
   options.source = TrackSource.SOURCE_MICROPHONE;
 
-  // IMPORTANT: publication is what holds the SID
   const publication = await room.localParticipant.publishTrack(track, options);
   console.log("Published audio track", {
     room: room.name || "(unknown)",
@@ -194,8 +224,8 @@ async function speakTextIntoRoom(room, text) {
     publication: {
       sid: publication?.trackSid ?? publication?.sid,
       name: publication?.trackName || "avatar-audio",
-      source: "microphone"
-    }
+      source: "microphone",
+    },
   });
 
   // 4) Push frames
@@ -204,42 +234,14 @@ async function speakTextIntoRoom(room, text) {
     await source.captureFrame(frame);
   }
 
-  // small drain so last frames flush
-  await new Promise((r) => setTimeout(r, 1000));
-
-  // ✅ Unpublish the track if we have a publication SID; otherwise fall back gracefully
-  try {
-    const publicationSid =
-      publication?.trackSid ??
-      publication?.sid ??
-      (typeof publication?.toJSON === "function" ? publication.toJSON()?.sid : undefined);
-
-    /*
-    if (publicationSid) {
-      await room.localParticipant.unpublishTrack(publicationSid, { stopOnUnpublish: true });
-    } else {
-      // some SDKs also accept the track object directly
-      await room.localParticipant.unpublishTrack(track, { stopOnUnpublish: true });
-    }
-    */
-    setTimeout(async () => {
-      try {
-        if (publicationSid) {
-          await room.localParticipant.unpublishTrack(publicationSid, { stopOnUnpublish: true });
-        } else {
-          await room.localParticipant.unpublishTrack(track, { stopOnUnpublish: true });
-        }
-        if (typeof track.stop === "function") track.stop();
-        if (typeof source.stop === "function") source.stop();
-      } catch (e) {
-        console.warn("delayed unpublishTrack failed:", e);
-      }
-    }, 1500);
-  } catch (e) {
-    console.warn("unpublishTrack failed (continuing anyway):", e);
-  }
+  // 5) dwell → unpublish deterministically (no setTimeout tear-down races)
+  await new Promise((r) => setTimeout(r, 1000)); // let subscribers attach & play
+  await safeUnpublish(room, publication, track);
+  try { if (typeof track.stop === "function") track.stop(); } catch {}
+  try { if (typeof source.stop === "function") source.stop(); } catch {}
 }
 
+// ── LLM ───────────────────────────────────────────────────────────────────────
 async function llmReply(userText) {
   const res = await openai.chat.completions.create({
     model: "gpt-4o-mini",
@@ -251,8 +253,7 @@ async function llmReply(userText) {
   return res.choices?.[0]?.message?.content ?? "Sorry, I couldn't think of anything to say.";
 }
 
-// ---- HTTP Endpoints ----
-
+// ── ROUTES ────────────────────────────────────────────────────────────────────
 app.get("/healthz", (_req, res) => {
   res.json({ ok: true, mode: process.env.BOT_MODE || BOT_MODE, room: DEFAULT_ROOM });
 });
@@ -267,6 +268,7 @@ app.post("/mode", (req, res) => {
   }
 });
 
+// persistent join/leave
 app.post("/join", async (req, res) => {
   const roomName = req.body?.roomName || DEFAULT_ROOM;
   if (persistent?.room) return res.json({ ok: true, info: "already connected" });
@@ -293,6 +295,7 @@ app.post("/leave", async (_req, res) => {
   }
 });
 
+// speak
 app.post("/message", async (req, res) => {
   const roomName = req.body?.roomName || DEFAULT_ROOM;
   const textIn = String(req.body?.text || "").trim();
@@ -300,7 +303,9 @@ app.post("/message", async (req, res) => {
 
   if (!textIn) return res.status(400).json({ ok: false, error: "text required" });
 
-  const mode = keep === true || keep === false ? (keep ? "PERSISTENT" : "TRANSIENT") : (process.env.BOT_MODE || BOT_MODE);
+  const mode = keep === true || keep === false
+    ? (keep ? "PERSISTENT" : "TRANSIENT")
+    : (process.env.BOT_MODE || BOT_MODE);
 
   try {
     const reply = await llmReply(textIn);
@@ -314,6 +319,8 @@ app.post("/message", async (req, res) => {
     } else {
       const room = await connectToRoom(roomName);
       await speakTextIntoRoom(room, reply);
+      // small grace after unpublish before disconnect
+      await new Promise((r) => setTimeout(r, 300));
       await room.disconnect();
     }
 
@@ -324,10 +331,10 @@ app.post("/message", async (req, res) => {
   }
 });
 
-// Viewer token (subscribe-only)
+// viewer token (subscribe-only)
 app.get("/token", async (req, res) => {
   try {
-    const roomName = String(req.query.room || process.env.DEFAULT_ROOM || "demo");
+    const roomName = String(req.query.room || DEFAULT_ROOM || "default");
     const identity = String(req.query.user || "viewer-" + Math.random().toString(36).slice(2, 8));
     const ttlMin = Number(process.env.CLIENT_TOKEN_TTL_MIN || 60);
 
@@ -349,7 +356,7 @@ app.get("/token", async (req, res) => {
   }
 });
 
-// 🔎 Piper health passthrough
+// ── DIAGNOSTICS ───────────────────────────────────────────────────────────────
 app.get("/diag/piper", async (_req, res) => {
   try {
     const r = await fetch(`${PIPER_URL}/healthz`);
@@ -359,35 +366,42 @@ app.get("/diag/piper", async (_req, res) => {
   }
 });
 
-// 🔊 Publish a 440Hz test tone for quick path testing
+app.get("/diag/connect", async (_req, res) => {
+  try {
+    const room = await connectToRoom(DEFAULT_ROOM || "default");
+    await room.disconnect();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// publish 440 Hz tone
 app.post("/diag/tone", async (req, res) => {
   try {
-    const roomName = req.body?.roomName || process.env.DEFAULT_ROOM || "default";
+    const roomName = req.body?.roomName || DEFAULT_ROOM || "default";
     const durationSec = Number(req.body?.durationSec ?? 2);
     const rate = 48000;
     const frameMs = 20;
-    const samplesPerFrame = Math.floor(rate * frameMs / 1000);
+    const samplesPerFrame = Math.floor((rate * frameMs) / 1000);
     const freq = Number(req.body?.freq ?? 440);
+    const totalFrames = Math.ceil((durationSec * 1000) / frameMs);
 
-    // Connect transiently
     const room = await connectToRoom(roomName);
 
-    // Create source & track
     const source = new AudioSource(rate, 1);
     const track = LocalAudioTrack.createAudioTrack("avatar-tone", source);
     const opts = new TrackPublishOptions();
     opts.source = TrackSource.SOURCE_MICROPHONE;
     const publication = await room.localParticipant.publishTrack(track, opts);
 
-    // Generate frames
-    const totalFrames = Math.ceil((durationSec * 1000) / frameMs);
     let t = 0;
-    const phaseInc = 2 * Math.PI * freq / rate;
-
+    const phaseInc = (2 * Math.PI * freq) / rate;
     for (let i = 0; i < totalFrames; i++) {
       const pcm = new Int16Array(samplesPerFrame);
       for (let n = 0; n < samplesPerFrame; n++) {
-        const s = Math.sin(t) * 0.25; // 25% volume
+        const s = Math.sin(t) * 0.25;
         pcm[n] = s < 0 ? s * 0x8000 : s * 0x7fff;
         t += phaseInc;
       }
@@ -396,28 +410,13 @@ app.post("/diag/tone", async (req, res) => {
       await source.captureFrame(frame);
     }
 
-    // Small drain
-    await new Promise(r => setTimeout(r, 120));
-
-    // Unpublish cleanly
-    try {
-      const publicationSid =
-        publication?.trackSid ??
-        publication?.sid ??
-        (typeof publication?.toJSON === "function" ? publication.toJSON()?.sid : undefined);
-      if (publicationSid) {
-        await room.localParticipant.unpublishTrack(publicationSid, { stopOnUnpublish: true });
-      } else {
-        await room.localParticipant.unpublishTrack(track, { stopOnUnpublish: true });
-      }
-    } catch (e) {
-      console.warn("unpublishTrack failed (tone):", e);
-    }
-
-    if (typeof track.stop === "function") track.stop();
-    if (typeof source.stop === "function") source.stop();
-
+    await new Promise((r) => setTimeout(r, 1000));
+    await safeUnpublish(room, publication, track);
+    try { if (typeof track.stop === "function") track.stop(); } catch {}
+    try { if (typeof source.stop === "function") source.stop(); } catch {}
+    await new Promise((r) => setTimeout(r, 300));
     await room.disconnect();
+
     res.json({ ok: true, roomName, freq, durationSec });
   } catch (e) {
     console.error(e);
@@ -425,14 +424,14 @@ app.post("/diag/tone", async (req, res) => {
   }
 });
 
-// 🔇 Publish 3s of silence to verify subscription/subscription timing
+// publish N seconds of silence (subscription timing check)
 app.post("/diag/silence", async (req, res) => {
   try {
-    const roomName = req.body?.roomName || process.env.DEFAULT_ROOM || "default";
+    const roomName = req.body?.roomName || DEFAULT_ROOM || "default";
     const durationSec = Number(req.body?.durationSec ?? 3);
     const rate = 48000;
     const frameMs = 20;
-    const samplesPerFrame = Math.floor(rate * frameMs / 1000);
+    const samplesPerFrame = Math.floor((rate * frameMs) / 1000);
     const totalFrames = Math.ceil((durationSec * 1000) / frameMs);
 
     const room = await connectToRoom(roomName);
@@ -444,28 +443,19 @@ app.post("/diag/silence", async (req, res) => {
     const publication = await room.localParticipant.publishTrack(track, opts);
 
     for (let i = 0; i < totalFrames; i++) {
-      const pcm = new Int16Array(samplesPerFrame); // all zeros = silence
+      const pcm = new Int16Array(samplesPerFrame); // zeros
       const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
       const frame = new AudioFrame(buf, rate, 1, samplesPerFrame);
       await source.captureFrame(frame);
     }
 
-    // keep it around a bit more, then clean up
-    await new Promise(r => setTimeout(r, 1000));
-
-    const publicationSid =
-      publication?.trackSid ??
-      publication?.sid ??
-      (typeof publication?.toJSON === "function" ? publication.toJSON()?.sid : undefined);
-    if (publicationSid) {
-      await room.localParticipant.unpublishTrack(publicationSid, { stopOnUnpublish: true });
-    } else {
-      await room.localParticipant.unpublishTrack(track, { stopOnUnpublish: true });
-    }
-    if (typeof track.stop === "function") track.stop();
-    if (typeof source.stop === "function") source.stop();
-
+    await new Promise((r) => setTimeout(r, 1000));
+    await safeUnpublish(room, publication, track);
+    try { if (typeof track.stop === "function") track.stop(); } catch {}
+    try { if (typeof source.stop === "function") source.stop(); } catch {}
+    await new Promise((r) => setTimeout(r, 300));
     await room.disconnect();
+
     res.json({ ok: true, roomName, durationSec });
   } catch (e) {
     console.error(e);
@@ -473,17 +463,6 @@ app.post("/diag/silence", async (req, res) => {
   }
 });
 
-// 🔎 LiveKit connect-only check
-app.get("/diag/connect", async (_req, res) => {
-  try {
-    const room = await connectToRoom(process.env.DEFAULT_ROOM || "demo");
-    await room.disconnect();
-    res.json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
-
+// ── START ─────────────────────────────────────────────────────────────────────
 const port = process.env.PORT || 8080;
 app.listen(port, () => console.log(`avatarbot_service listening on ${port}`));
