@@ -63,7 +63,7 @@ app.get("/__debug/files", (_req, res) => {
 app.use((req, res, next) => {
   const needsAuth =
     req.method === "POST" &&
-    ["/message", "/join", "/leave", "/mode", "/diag/tone", "/diag/silence"].includes(req.path);
+    ["/message", "/join", "/leave", "/mode", "/diag/tone", "/diag/silence", "/diag/tone_hold", "/diag/silence_hold"].includes(req.path);
   if (!needsAuth) return next();
   const provided = req.headers["x-bot-auth"];
   if (!process.env.BOT_AUTH || provided === process.env.BOT_AUTH) return next();
@@ -91,23 +91,12 @@ function mintServerToken({ roomName, identity, canPublish = true }) {
 async function connectToRoom(roomName, identity = BOT_IDENTITY) {
   const room = new Room();
   const token = await mintServerToken({ roomName, identity, canPublish: true });
-  try {
-    await room.connect(LIVEKIT_URL, token);
-    return room;
-  } catch (e) {
-    console.error("LiveKit connect failed", {
-      url: LIVEKIT_URL,
-      roomName,
-      identity,
-      iss: (process.env.LIVEKIT_API_KEY || "").slice(0, 4) + "…",
-      msg: String(e),
-    });
-    throw e;
-  }
+  await room.connect(LIVEKIT_URL, token);
+  console.log("Connected to LiveKit", { roomName, identity });
+  return room;
 }
 
 async function safeUnpublish(room, publication, track) {
-  // Try all known signatures across rtc-node variants.
   const sid =
     publication?.trackSid ??
     publication?.sid ??
@@ -122,9 +111,9 @@ async function safeUnpublish(room, publication, track) {
   ];
 
   let lastErr = null;
-  for (const fn of attempts) {
+  for (const tryIt of attempts) {
     try {
-      const p = fn();
+      const p = tryIt();
       if (!p) continue;
       await p;
       console.log("unpublishTrack: success");
@@ -234,7 +223,7 @@ async function speakTextIntoRoom(room, text) {
     await source.captureFrame(frame);
   }
 
-  // 5) dwell → unpublish deterministically (no setTimeout tear-down races)
+  // 5) dwell → unpublish (deterministic, avoids engine tear-downs)
   await new Promise((r) => setTimeout(r, 1000)); // let subscribers attach & play
   await safeUnpublish(room, publication, track);
   try { if (typeof track.stop === "function") track.stop(); } catch {}
@@ -268,7 +257,6 @@ app.post("/mode", (req, res) => {
   }
 });
 
-// persistent join/leave
 app.post("/join", async (req, res) => {
   const roomName = req.body?.roomName || DEFAULT_ROOM;
   if (persistent?.room) return res.json({ ok: true, info: "already connected" });
@@ -295,12 +283,10 @@ app.post("/leave", async (_req, res) => {
   }
 });
 
-// speak
 app.post("/message", async (req, res) => {
   const roomName = req.body?.roomName || DEFAULT_ROOM;
   const textIn = String(req.body?.text || "").trim();
   const keep = req.body?.keep;
-
   if (!textIn) return res.status(400).json({ ok: false, error: "text required" });
 
   const mode = keep === true || keep === false
@@ -319,8 +305,7 @@ app.post("/message", async (req, res) => {
     } else {
       const room = await connectToRoom(roomName);
       await speakTextIntoRoom(room, reply);
-      // small grace after unpublish before disconnect
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 300)); // grace before disconnect
       await room.disconnect();
     }
 
@@ -377,7 +362,7 @@ app.get("/diag/connect", async (_req, res) => {
   }
 });
 
-// publish 440 Hz tone
+// 440 Hz tone (short)
 app.post("/diag/tone", async (req, res) => {
   try {
     const roomName = req.body?.roomName || DEFAULT_ROOM || "default";
@@ -424,39 +409,106 @@ app.post("/diag/tone", async (req, res) => {
   }
 });
 
-// publish N seconds of silence (subscription timing check)
-app.post("/diag/silence", async (req, res) => {
+// 440 Hz tone (HOLD ~20s so browser can definitely subscribe)
+app.post("/diag/tone_hold", async (req, res) => {
   try {
     const roomName = req.body?.roomName || DEFAULT_ROOM || "default";
-    const durationSec = Number(req.body?.durationSec ?? 3);
     const rate = 48000;
     const frameMs = 20;
     const samplesPerFrame = Math.floor((rate * frameMs) / 1000);
-    const totalFrames = Math.ceil((durationSec * 1000) / frameMs);
+    const freq = Number(req.body?.freq ?? 440);
+    const holdMs = Number(req.body?.holdMs ?? 20000); // 20s
 
     const room = await connectToRoom(roomName);
 
     const source = new AudioSource(rate, 1);
-    const track = LocalAudioTrack.createAudioTrack("avatar-silence", source);
+    const track = LocalAudioTrack.createAudioTrack("avatar-tone-hold", source);
     const opts = new TrackPublishOptions();
     opts.source = TrackSource.SOURCE_MICROPHONE;
     const publication = await room.localParticipant.publishTrack(track, opts);
 
-    for (let i = 0; i < totalFrames; i++) {
-      const pcm = new Int16Array(samplesPerFrame); // zeros
-      const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-      const frame = new AudioFrame(buf, rate, 1, samplesPerFrame);
-      await source.captureFrame(frame);
-    }
+    // keep pushing a continuous tone until hold ends
+    let running = true;
+    (async () => {
+      let t = 0;
+      const phaseInc = (2 * Math.PI * freq) / rate;
+      while (running) {
+        const pcm = new Int16Array(samplesPerFrame);
+        for (let n = 0; n < samplesPerFrame; n++) {
+          const s = Math.sin(t) * 0.2;
+          pcm[n] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          t += phaseInc;
+        }
+        const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+        const frame = new AudioFrame(buf, rate, 1, samplesPerFrame);
+        await source.captureFrame(frame);
+      }
+    })();
 
-    await new Promise((r) => setTimeout(r, 1000));
-    await safeUnpublish(room, publication, track);
-    try { if (typeof track.stop === "function") track.stop(); } catch {}
-    try { if (typeof source.stop === "function") source.stop(); } catch {}
-    await new Promise((r) => setTimeout(r, 300));
-    await room.disconnect();
+    // schedule cleanup after hold
+    setTimeout(async () => {
+      try {
+        running = false;
+        await new Promise((r) => setTimeout(r, 200)); // small drain
+        await safeUnpublish(room, publication, track);
+        try { if (typeof track.stop === "function") track.stop(); } catch {}
+        try { if (typeof source.stop === "function") source.stop(); } catch {}
+        await new Promise((r) => setTimeout(r, 300));
+        await room.disconnect();
+      } catch (e) {
+        console.warn("tone_hold cleanup failed:", e?.message || e);
+      }
+    }, holdMs);
 
-    res.json({ ok: true, roomName, durationSec });
+    res.json({ ok: true, roomName, freq, holdMs });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// Silence (HOLD ~20s)
+app.post("/diag/silence_hold", async (req, res) => {
+  try {
+    const roomName = req.body?.roomName || DEFAULT_ROOM || "default";
+    const rate = 48000;
+    const frameMs = 20;
+    const samplesPerFrame = Math.floor((rate * frameMs) / 1000);
+    const holdMs = Number(req.body?.holdMs ?? 20000);
+
+    const room = await connectToRoom(roomName);
+
+    const source = new AudioSource(rate, 1);
+    const track = LocalAudioTrack.createAudioTrack("avatar-silence-hold", source);
+    const opts = new TrackPublishOptions();
+    opts.source = TrackSource.SOURCE_MICROPHONE;
+    const publication = await room.localParticipant.publishTrack(track, opts);
+
+    let running = true;
+    (async () => {
+      while (running) {
+        const pcm = new Int16Array(samplesPerFrame); // zeros
+        const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+        const frame = new AudioFrame(buf, rate, 1, samplesPerFrame);
+        await source.captureFrame(frame);
+      }
+    })();
+
+    setTimeout(async () => {
+      try {
+        running = false;
+        await new Promise((r) => setTimeout(r, 200));
+        await safeUnpublish(room, publication, track);
+        try { if (typeof track.stop === "function") track.stop(); } catch {}
+        try { if (typeof source.stop === "function") source.stop(); } catch {}
+        await new Promise((r) => setTimeout(r, 300));
+        await room.disconnect();
+      } catch (e) {
+        console.warn("silence_hold cleanup failed:", e?.message || e);
+      }
+    }, holdMs);
+
+    res.json({ ok: true, roomName, holdMs });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e) });
