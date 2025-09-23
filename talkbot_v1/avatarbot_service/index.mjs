@@ -165,7 +165,8 @@ async function speakTextIntoRoom(room, text) {
   const options = new TrackPublishOptions();
   options.source = TrackSource.SOURCE_MICROPHONE;
 
-  await room.localParticipant.publishTrack(track, options);
+  //await room.localParticipant.publishTrack(track, options);
+  const pub = await room.localParticipant.publishTrack(track, options);
 
   // 4) Push frames
   for (const f of frames) {
@@ -176,8 +177,10 @@ async function speakTextIntoRoom(room, text) {
   // small drain so last frames flush
   await new Promise((r) => setTimeout(r, 200));
 
-  // ✅ unpublish, then stop the track; do NOT call close()
-  await room.localParticipant.unpublishTrack(track);
+  // ✅ unpublish and stop: pass the required boolean flag
+  await room.localParticipant.unpublishTrack(pub.trackSid, /* stopOnUnpublish */ true);
+
+
   if (typeof track.stop === "function") track.stop();
   if (typeof source.stop === "function") source.stop();
 }
