@@ -177,9 +177,9 @@ async function speakTextIntoRoom(room, text) {
   // small drain so last frames flush
   await new Promise((r) => setTimeout(r, 200));
 
-  // ✅ unpublish and stop: pass the required boolean flag
-  await room.localParticipant.unpublishTrack(pub.trackSid, /* stopOnUnpublish */ true);
-
+  // ✅ unpublish and stop: make sure we pass the SID field available on this SDK version
+  const sid = pub?.trackSid ?? pub?.sid;
+  if (sid) await room.localParticipant.unpublishTrack(sid, /* stopOnUnpublish */ true);
 
   if (typeof track.stop === "function") track.stop();
   if (typeof source.stop === "function") source.stop();
