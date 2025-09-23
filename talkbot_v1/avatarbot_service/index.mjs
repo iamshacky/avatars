@@ -188,6 +188,11 @@ async function speakTextIntoRoom(room, text) {
 
   // IMPORTANT: publication is what holds the SID
   const publication = await room.localParticipant.publishTrack(track, options);
+  console.log("Published audio track", {
+    room: room.name || "(unknown)",
+    sid: publication?.trackSid ?? publication?.sid,
+    name: publication?.trackName || "avatar-audio"
+  });
 
   // 4) Push frames
   for (const f of frames) {
@@ -335,6 +340,72 @@ app.get("/diag/piper", async (_req, res) => {
     const r = await fetch(`${PIPER_URL}/healthz`);
     res.json({ ok: r.ok, status: r.status });
   } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// 🔊 Publish a 440Hz test tone for quick path testing
+app.post("/diag/tone", async (req, res) => {
+  try {
+    const roomName = req.body?.roomName || process.env.DEFAULT_ROOM || "default";
+    const durationSec = Number(req.body?.durationSec ?? 2);
+    const rate = 48000;
+    const frameMs = 20;
+    const samplesPerFrame = Math.floor(rate * frameMs / 1000);
+    const freq = Number(req.body?.freq ?? 440);
+
+    // Connect transiently
+    const room = await connectToRoom(roomName);
+
+    // Create source & track
+    const source = new AudioSource(rate, 1);
+    const track = LocalAudioTrack.createAudioTrack("avatar-tone", source);
+    const opts = new TrackPublishOptions();
+    opts.source = TrackSource.SOURCE_MICROPHONE;
+    const publication = await room.localParticipant.publishTrack(track, opts);
+
+    // Generate frames
+    const totalFrames = Math.ceil((durationSec * 1000) / frameMs);
+    let t = 0;
+    const phaseInc = 2 * Math.PI * freq / rate;
+
+    for (let i = 0; i < totalFrames; i++) {
+      const pcm = new Int16Array(samplesPerFrame);
+      for (let n = 0; n < samplesPerFrame; n++) {
+        const s = Math.sin(t) * 0.25; // 25% volume
+        pcm[n] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        t += phaseInc;
+      }
+      const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+      const frame = new AudioFrame(buf, rate, 1, samplesPerFrame);
+      await source.captureFrame(frame);
+    }
+
+    // Small drain
+    await new Promise(r => setTimeout(r, 120));
+
+    // Unpublish cleanly
+    try {
+      const publicationSid =
+        publication?.trackSid ??
+        publication?.sid ??
+        (typeof publication?.toJSON === "function" ? publication.toJSON()?.sid : undefined);
+      if (publicationSid) {
+        await room.localParticipant.unpublishTrack(publicationSid, { stopOnUnpublish: true });
+      } else {
+        await room.localParticipant.unpublishTrack(track, { stopOnUnpublish: true });
+      }
+    } catch (e) {
+      console.warn("unpublishTrack failed (tone):", e);
+    }
+
+    if (typeof track.stop === "function") track.stop();
+    if (typeof source.stop === "function") source.stop();
+
+    await room.disconnect();
+    res.json({ ok: true, roomName, freq, durationSec });
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ ok: false, error: String(e) });
   }
 });

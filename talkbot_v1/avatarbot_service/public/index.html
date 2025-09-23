@@ -66,6 +66,12 @@
           console.log("Subscribed to audio from:", participant.identity, pub.trackSid || pub.sid || pub.trackName);
           const mediaStream = new MediaStream([pub.track.mediaStreamTrack]);
           audioEl.srcObject = mediaStream;
+          audioEl.muted = false;
+          audioEl.play().then(() => {
+            console.log("audioEl.play() resolved");
+          }).catch((e) => {
+            console.warn("audioEl.play() blocked or failed:", e);
+          });
           animateMouth(mediaStream);
         }
       });
