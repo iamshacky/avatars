@@ -1,0 +1,164 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Avatar Viewer</title>
+<style>
+  #face { width: 240px; height: 240px; border-radius: 50%; background: #eee;
+          display: flex; align-items: center; justify-content: center; margin: 24px auto; }
+  #mouth { width: 64px; height: 12px; border-radius: 8px; background: #333;
+          transition: height 60ms; }
+  body { font-family: sans-serif; max-width: 720px; margin: 20px auto; }
+  label,input,button { font-size: 16px; }
+</style>
+<body>
+  <h1>Avatar Viewer</h1>
+
+  <div>
+    <label>Room: <input id="room" value="demo"></label>
+    <label>User: <input id="user" value="viewer"></label>
+    <button id="joinBtn">Join</button>
+  </div>
+
+  <div id="face"><div id="mouth"></div></div>
+  <audio id="audio" autoplay></audio>
+
+  <div>
+    <textarea id="msg" rows="3" style="width:100%;">Say hello to everyone.</textarea>
+    <div style="margin-top:8px;">
+      <button id="speakOnce">Speak (transient)</button>
+      <button id="stayJoin">Join (persistent)</button>
+      <button id="staySpeak">Speak (persistent)</button>
+      <button id="stayLeave">Leave</button>
+    </div>
+  </div>
+
+  <script type="module">
+    import { Room, RoomEvent } from "https://cdn.skypack.dev/livekit-client";
+
+    const audioEl = document.getElementById("audio");
+    const mouthEl = document.getElementById("mouth");
+    const roomInput = document.getElementById("room");
+    const userInput = document.getElementById("user");
+
+    let room;
+
+    // ---- config ----
+    const BOT_BASE = "https://exciting-nourishment-production.up.railway.app";
+    // If you enabled the security middleware, set this to the same string in Railway BOT_AUTH.
+    // If you didn't enable it, leave it empty "".
+    const BOT_AUTH = ""; // e.g. "my-long-shared-secret"
+
+    async function getClientToken(roomName, userName) {
+      const r = await fetch(`${BOT_BASE}/token?room=${encodeURIComponent(roomName)}&user=${encodeURIComponent(userName)}`);
+      if (!r.ok) throw new Error("token fetch failed");
+      return r.text();
+    }
+
+    async function connect() {
+      const roomName = roomInput.value || "default";
+      const userName = userInput.value || ("viewer-" + Math.random().toString(36).slice(2,8));
+      const token = await getClientToken(roomName, userName);
+
+      room = new Room();
+      await room.connect("wss://project1-5bgowgi3.livekit.cloud", token);
+
+      room.on(RoomEvent.TrackSubscribed, (_track, pub) => {
+        if (pub.kind === "audio") {
+          const mediaStream = new MediaStream([pub.track.mediaStreamTrack]);
+          audioEl.srcObject = mediaStream;
+          animateMouth(mediaStream);
+        }
+      });
+    }
+
+    function animateMouth(stream) {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      src.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      function tick() {
+        analyser.getByteFrequencyData(data);
+        let level = 0;
+        for (let i = 0; i < data.length; i++) level += data[i];
+        level = level / data.length;
+        const h = 10 + Math.min(90, level / 2.5);
+        mouthEl.style.height = h + "px";
+        requestAnimationFrame(tick);
+      }
+      tick();
+    }
+
+    document.getElementById("joinBtn").onclick = connect;
+
+    // ---- shared POST helper (now with optional auth + better errors) ----
+    async function postJSON(path, body) {
+      const headers = { "content-type": "application/json" };
+      if (BOT_AUTH) headers["x-bot-auth"] = BOT_AUTH;
+
+      const r = await fetch(BOT_BASE + path, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body)
+      });
+
+      let payloadText = "";
+      try { payloadText = await r.text(); } catch {}
+      let json;
+      try { json = payloadText ? JSON.parse(payloadText) : null; } catch {}
+
+      if (!r.ok) {
+        console.error("POST failed", path, r.status, payloadText);
+        throw new Error(`${path} ${r.status}: ${payloadText || "request failed"}`);
+      }
+      return json ?? {};
+    }
+
+    // buttons → API
+    document.getElementById("speakOnce").onclick = async () => {
+      try {
+        const roomName = roomInput.value || "default";
+        const text = document.getElementById("msg").value || "Hello from AvatarBot!";
+        const res = await postJSON("/message", { roomName, text, keep: false });
+        console.log("speakOnce ok", res);
+      } catch (e) {
+        console.error(e);
+        alert(e.message);
+      }
+    };
+
+    document.getElementById("stayJoin").onclick = async () => {
+      try {
+        const roomName = roomInput.value || "default";
+        const res = await postJSON("/join", { roomName });
+        console.log("stayJoin ok", res);
+      } catch (e) {
+        console.error(e);
+        alert(e.message);
+      }
+    };
+
+    document.getElementById("staySpeak").onclick = async () => {
+      try {
+        const roomName = roomInput.value || "default";
+        const text = document.getElementById("msg").value || "Introduce yourself.";
+        const res = await postJSON("/message", { roomName, text, keep: true });
+        console.log("staySpeak ok", res);
+      } catch (e) {
+        console.error(e);
+        alert(e.message);
+      }
+    };
+
+    document.getElementById("stayLeave").onclick = async () => {
+      try {
+        const res = await postJSON("/leave", {});
+        console.log("stayLeave ok", res);
+      } catch (e) {
+        console.error(e);
+        alert(e.message);
+      }
+    };
+  </script>
+
+</body>
