@@ -109,10 +109,11 @@ async function connectToRoom(roomName, identity = BOT_IDENTITY) {
 
 async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
   // decode WAV -> Float32 PCM
-  const { sampleRate, channelData } = await decode(wavBuf);
+  const { sampleRate: srcRate, channelData } = await decode(wavBuf);
   const channels = channelData.length;
-  const ch0 = channelData[0]; // Float32Array [-1,1]
-  // For mono, great; if stereo, downmix simple average for now
+  const ch0 = channelData[0]; // Float32Array [-1, 1]
+
+  // Downmix to mono if needed
   let mono;
   if (channels === 1) {
     mono = ch0;
@@ -126,23 +127,43 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
     }
   }
 
-  // convert to int16
-  const pcm16 = new Int16Array(mono.length);
+  // Convert float32 [-1,1] -> int16
+  const pcm16src = new Int16Array(mono.length);
   for (let i = 0; i < mono.length; i++) {
     const s = Math.max(-1, Math.min(1, mono[i]));
-    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    pcm16src[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
 
-  // split into 20ms frames (or desiredFrameMs)
-  const samplesPerFrame = Math.floor((sampleRate * desiredFrameMs) / 1000);
+  // ---- resample to 48kHz mono ----
+  const dstRate = 48000;
+  let pcm16 = pcm16src;
+  let rate = srcRate;
+  if (srcRate !== dstRate) {
+    const ratio = dstRate / srcRate;
+    const dstLen = Math.round(pcm16src.length * ratio);
+    const out = new Int16Array(dstLen);
+    for (let i = 0; i < dstLen; i++) {
+      const srcIndex = i / ratio;
+      const i0 = Math.floor(srcIndex);
+      const i1 = Math.min(i0 + 1, pcm16src.length - 1);
+      const frac = srcIndex - i0;
+      const s0 = pcm16src[i0];
+      const s1 = pcm16src[i1];
+      out[i] = s0 + (s1 - s0) * frac;
+    }
+    pcm16 = out;
+    rate = dstRate;
+  }
+
+  // Frame into 20 ms chunks at dstRate (48kHz → 960 samples per frame)
+  const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000);
   const frames = [];
   for (let offset = 0; offset < pcm16.length; offset += samplesPerFrame) {
     const slice = pcm16.subarray(offset, Math.min(offset + samplesPerFrame, pcm16.length));
-    // AudioFrame expects interleaved int16 bytes (num_channels=1 here)
     const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-    frames.push({ buf, sampleRate, samplesPerChannel: slice.length, numChannels: 1 });
+    frames.push({ buf, sampleRate: rate, samplesPerChannel: slice.length, numChannels: 1 });
   }
-  return { frames, sampleRate, channels: 1 };
+  return { frames, sampleRate: rate, channels: 1 };
 }
 
 async function speakTextIntoRoom(room, text) {
