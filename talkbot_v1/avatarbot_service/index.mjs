@@ -71,7 +71,6 @@ app.use((req, res, next) => {
 });
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-let persistent = null; // { room: Room, roomName: string }
 
 // ── LIVEKIT HELPERS ───────────────────────────────────────────────────────────
 function mintServerToken({ roomName, identity, canPublish = true }) {
@@ -88,11 +87,53 @@ function mintServerToken({ roomName, identity, canPublish = true }) {
   return at.toJwt();
 }
 
+// Add lightweight state flags on the Room we return
+function wireRoom(room) {
+  room.__lkState = { connected: true, lastError: null };
+
+  room.on?.("connected", () => {
+    room.__lkState.connected = true;
+    console.log("LK room connected");
+  });
+  room.on?.("disconnected", () => {
+    room.__lkState.connected = false;
+    console.log("LK room disconnected");
+  });
+  room.on?.("reconnecting", () => console.log("LK room reconnecting"));
+  room.on?.("reconnected", () => console.log("LK room reconnected"));
+  room.on?.("connectionStateChanged", (s) => console.log("LK conn state:", s));
+  room.on?.("participantConnected", (p) => console.log("LK participant+", p?.identity));
+  room.on?.("participantDisconnected", (p) => console.log("LK participant-", p?.identity));
+  room.on?.("trackPublished", (pub) => console.log("LK trackPublished", pub?.trackSid || pub?.sid || pub?.trackName));
+  room.on?.("trackUnpublished", (pub) => console.log("LK trackUnpublished", pub?.trackSid || pub?.sid || pub?.trackName));
+  room.on?.("engineError", (e) => {
+    room.__lkState.lastError = e;
+    console.warn("LK engineError:", e?.message || String(e));
+  });
+
+  return room;
+}
+
 async function connectToRoom(roomName, identity = BOT_IDENTITY) {
   const room = new Room();
   const token = await mintServerToken({ roomName, identity, canPublish: true });
   await room.connect(LIVEKIT_URL, token);
+  wireRoom(room);
   console.log("Connected to LiveKit", { roomName, identity });
+  return room;
+}
+
+function isRoomUsable(room) {
+  if (!room) return false;
+  // Prefer our flag; fall back to truthy localParticipant as a heuristic
+  if (room.__lkState && room.__lkState.connected) return true;
+  return !!room.localParticipant;
+}
+
+async function ensurePersistentRoom(roomName) {
+  if (persistent?.room && isRoomUsable(persistent.room)) return persistent.room;
+  const room = await connectToRoom(roomName);
+  persistent = { room, roomName };
   return room;
 }
 
@@ -185,8 +226,34 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
   return { frames, sampleRate: rate, channels: 1 };
 }
 
-// ── SPEAK: TTS → PUBLISH → DWELL → UNPUBLISH ─────────────────────────────────
-async function speakTextIntoRoom(room, text) {
+// ── SPEAK: TTS → PUBLISH → DWELL → UNPUBLISH (with retry) ────────────────────
+async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-audio") {
+  const source = new AudioSource(sampleRate, 1);
+  const track = LocalAudioTrack.createAudioTrack(trackName, source);
+  const options = new TrackPublishOptions();
+  options.source = TrackSource.SOURCE_MICROPHONE;
+
+  const publication = await room.localParticipant.publishTrack(track, options);
+  console.log("Published audio track", {
+    identity: room.localParticipant?.identity,
+    publication: {
+      sid: publication?.trackSid ?? publication?.sid,
+      name: publication?.trackName || trackName,
+    },
+  });
+
+  for (const f of frames) {
+    const frame = new AudioFrame(f.buf, f.sampleRate, f.numChannels, f.samplesPerChannel);
+    await source.captureFrame(frame);
+  }
+
+  await new Promise((r) => setTimeout(r, 1000)); // let subscribers attach & play
+  await safeUnpublish(room, publication, track);
+  try { if (typeof track.stop === "function") track.stop(); } catch {}
+  try { if (typeof source.stop === "function") source.stop(); } catch {}
+}
+
+async function speakTextIntoRoom(roomOrName, text) {
   // 1) Piper TTS to WAV
   const tts = await fetch(`${PIPER_URL}/synthesize`, {
     method: "POST",
@@ -199,35 +266,25 @@ async function speakTextIntoRoom(room, text) {
   // 2) Decode → 48k frames
   const { frames, sampleRate } = await wavToInt16Frames(wavBuf, 20);
 
-  // 3) Publish
-  const source = new AudioSource(sampleRate, 1);
-  const track = LocalAudioTrack.createAudioTrack("avatar-audio", source);
+  // 3) Ensure room and publish, with one retry if engine died
+  let room = typeof roomOrName === "string" ? await ensurePersistentRoom(roomOrName) : roomOrName;
 
-  const options = new TrackPublishOptions();
-  options.source = TrackSource.SOURCE_MICROPHONE;
-
-  const publication = await room.localParticipant.publishTrack(track, options);
-  console.log("Published audio track", {
-    room: room.name || "(unknown)",
-    identity: room.localParticipant?.identity,
-    publication: {
-      sid: publication?.trackSid ?? publication?.sid,
-      name: publication?.trackName || "avatar-audio",
-      source: "microphone",
-    },
-  });
-
-  // 4) Push frames
-  for (const f of frames) {
-    const frame = new AudioFrame(f.buf, f.sampleRate, f.numChannels, f.samplesPerChannel);
-    await source.captureFrame(frame);
+  try {
+    await publishFramesOnce(room, frames, sampleRate);
+  } catch (e) {
+    const msg = String(e || "");
+    console.warn("publish failed, first attempt:", msg);
+    if (msg.includes("engine is closed") || msg.includes("connection error")) {
+      // Reconnect and retry once
+      try {
+        await room.disconnect().catch(() => {});
+      } catch {}
+      room = await connectToRoom(DEFAULT_ROOM);
+      await publishFramesOnce(room, frames, sampleRate);
+    } else {
+      throw e;
+    }
   }
-
-  // 5) dwell → unpublish (deterministic, avoids engine tear-downs)
-  await new Promise((r) => setTimeout(r, 1000)); // let subscribers attach & play
-  await safeUnpublish(room, publication, track);
-  try { if (typeof track.stop === "function") track.stop(); } catch {}
-  try { if (typeof source.stop === "function") source.stop(); } catch {}
 }
 
 // ── LLM ───────────────────────────────────────────────────────────────────────
@@ -247,6 +304,11 @@ app.get("/healthz", (_req, res) => {
   res.json({ ok: true, mode: process.env.BOT_MODE || BOT_MODE, room: DEFAULT_ROOM });
 });
 
+app.get("/diag/state", (_req, res) => {
+  const st = persistent?.room?.__lkState || null;
+  res.json({ persistent: !!persistent?.room, state: st });
+});
+
 app.post("/mode", (req, res) => {
   const { mode } = req.body || {};
   if (mode && ["TRANSIENT", "PERSISTENT"].includes(mode)) {
@@ -257,12 +319,12 @@ app.post("/mode", (req, res) => {
   }
 });
 
+let persistent = null; // { room: Room, roomName: string }
+
 app.post("/join", async (req, res) => {
   const roomName = req.body?.roomName || DEFAULT_ROOM;
-  if (persistent?.room) return res.json({ ok: true, info: "already connected" });
   try {
-    const room = await connectToRoom(roomName);
-    persistent = { room, roomName };
+    await ensurePersistentRoom(roomName);
     res.json({ ok: true, roomName });
   } catch (e) {
     console.error(e);
@@ -297,11 +359,8 @@ app.post("/message", async (req, res) => {
     const reply = await llmReply(textIn);
 
     if (mode === "PERSISTENT") {
-      if (!persistent?.room) {
-        const room = await connectToRoom(roomName);
-        persistent = { room, roomName };
-      }
-      await speakTextIntoRoom(persistent.room, reply);
+      const room = await ensurePersistentRoom(roomName);
+      await speakTextIntoRoom(room, reply);
     } else {
       const room = await connectToRoom(roomName);
       await speakTextIntoRoom(room, reply);
@@ -362,7 +421,7 @@ app.get("/diag/connect", async (_req, res) => {
   }
 });
 
-// 440 Hz tone (short)
+// short tone
 app.post("/diag/tone", async (req, res) => {
   try {
     const roomName = req.body?.roomName || DEFAULT_ROOM || "default";
@@ -409,7 +468,7 @@ app.post("/diag/tone", async (req, res) => {
   }
 });
 
-// 440 Hz tone (HOLD ~20s so browser can definitely subscribe)
+// long-hold tone (~20s) to guarantee subscription window
 app.post("/diag/tone_hold", async (req, res) => {
   try {
     const roomName = req.body?.roomName || DEFAULT_ROOM || "default";
@@ -427,7 +486,6 @@ app.post("/diag/tone_hold", async (req, res) => {
     opts.source = TrackSource.SOURCE_MICROPHONE;
     const publication = await room.localParticipant.publishTrack(track, opts);
 
-    // keep pushing a continuous tone until hold ends
     let running = true;
     (async () => {
       let t = 0;
@@ -445,7 +503,6 @@ app.post("/diag/tone_hold", async (req, res) => {
       }
     })();
 
-    // schedule cleanup after hold
     setTimeout(async () => {
       try {
         running = false;
@@ -467,7 +524,7 @@ app.post("/diag/tone_hold", async (req, res) => {
   }
 });
 
-// Silence (HOLD ~20s)
+// long-hold silence (~20s)
 app.post("/diag/silence_hold", async (req, res) => {
   try {
     const roomName = req.body?.roomName || DEFAULT_ROOM || "default";
