@@ -40,31 +40,23 @@ if (!PIPER_URL) {
 }
 
 const app = express();
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-//app.use(express.static(path.join(__dirname, "public")));
-
-// (optional) serve it at the root path too
-/*
-app.get("/", (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-*/
-
-//app.use(express.static("public"));
-//app.use(cors());
-//app.use(express.json());
-
+const pubDir = path.join(__dirname, "public");
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 
-
+app.get("/__debug/files", (_req, res) => {
+  let exists = fs.existsSync(pubDir);
+  let listing = exists ? fs.readdirSync(pubDir) : [];
+  res.json({ __dirname, pubDir, exists, listing });
+});
 
 // 🔐 simple shared-secret gate for write endpoints
 app.use((req, res, next) => {
@@ -97,14 +89,6 @@ function mintServerToken({ roomName, identity, canPublish = true }) {
   return at.toJwt();
 }
 
-/*
-async function connectToRoom(roomName, identity = BOT_IDENTITY) {
-  const room = new Room();
-  const token = await mintServerToken({ roomName, identity, canPublish: true });
-  await room.connect(LIVEKIT_URL, await token);
-  return room;
-}
-*/
 async function connectToRoom(roomName, identity = BOT_IDENTITY) {
   const room = new Room();
   const token = await mintServerToken({ roomName, identity, canPublish: true });
@@ -174,23 +158,28 @@ async function speakTextIntoRoom(room, text) {
   // 2) Decode to PCM frames
   const { frames, sampleRate } = await wavToInt16Frames(wavBuf, 20);
 
-  // 3) Create AudioSource/Track and publish
+    // 3) Create source/track and publish
   const source = new AudioSource(sampleRate, 1);
   const track = LocalAudioTrack.createAudioTrack("avatar-audio", source);
+
   const options = new TrackPublishOptions();
   options.source = TrackSource.SOURCE_MICROPHONE;
 
   await room.localParticipant.publishTrack(track, options);
 
-  // 4) Push frames (blocking until queued)
+  // 4) Push frames
   for (const f of frames) {
     const frame = new AudioFrame(f.buf, f.sampleRate, f.numChannels, f.samplesPerChannel);
     await source.captureFrame(frame);
   }
 
-  // tiny drain
+  // small drain so last frames flush
   await new Promise((r) => setTimeout(r, 200));
-  await track.close(); // unpublish the temp track for transient speech
+
+  // ✅ unpublish, then stop the track; do NOT call close()
+  await room.localParticipant.unpublishTrack(track);
+  if (typeof track.stop === "function") track.stop();
+  if (typeof source.stop === "function") source.stop();
 }
 
 async function llmReply(userText) {
