@@ -158,15 +158,15 @@ async function speakTextIntoRoom(room, text) {
   // 2) Decode to PCM frames
   const { frames, sampleRate } = await wavToInt16Frames(wavBuf, 20);
 
-    // 3) Create source/track and publish
+  // 3) Create AudioSource/Track and publish
   const source = new AudioSource(sampleRate, 1);
   const track = LocalAudioTrack.createAudioTrack("avatar-audio", source);
 
   const options = new TrackPublishOptions();
   options.source = TrackSource.SOURCE_MICROPHONE;
 
-  //await room.localParticipant.publishTrack(track, options);
-  const pub = await room.localParticipant.publishTrack(track, options);
+  // IMPORTANT: publication is what holds the SID
+  const publication = await room.localParticipant.publishTrack(track, options);
 
   // 4) Push frames
   for (const f of frames) {
@@ -177,10 +177,24 @@ async function speakTextIntoRoom(room, text) {
   // small drain so last frames flush
   await new Promise((r) => setTimeout(r, 200));
 
-  // ✅ unpublish and stop: make sure we pass the SID field available on this SDK version
-  if (sid) await room.localParticipant.unpublishTrack(sid, { stopOnUnpublish: true });
+  // ✅ Unpublish the track if we have a publication SID; otherwise fall back gracefully
+  try {
+    const publicationSid =
+      publication?.trackSid ??
+      publication?.sid ??
+      (typeof publication?.toJSON === "function" ? publication.toJSON()?.sid : undefined);
 
+    if (publicationSid) {
+      await room.localParticipant.unpublishTrack(publicationSid, { stopOnUnpublish: true });
+    } else {
+      // some SDKs also accept the track object directly
+      await room.localParticipant.unpublishTrack(track, { stopOnUnpublish: true });
+    }
+  } catch (e) {
+    console.warn("unpublishTrack failed (continuing anyway):", e);
+  }
 
+  // Stop local resources regardless
   if (typeof track.stop === "function") track.stop();
   if (typeof source.stop === "function") source.stop();
 }
