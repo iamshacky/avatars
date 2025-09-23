@@ -190,8 +190,12 @@ async function speakTextIntoRoom(room, text) {
   const publication = await room.localParticipant.publishTrack(track, options);
   console.log("Published audio track", {
     room: room.name || "(unknown)",
-    sid: publication?.trackSid ?? publication?.sid,
-    name: publication?.trackName || "avatar-audio"
+    identity: room.localParticipant?.identity,
+    publication: {
+      sid: publication?.trackSid ?? publication?.sid,
+      name: publication?.trackName || "avatar-audio",
+      source: "microphone"
+    }
   });
 
   // 4) Push frames
@@ -201,7 +205,7 @@ async function speakTextIntoRoom(room, text) {
   }
 
   // small drain so last frames flush
-  await new Promise((r) => setTimeout(r, 200));
+  await new Promise((r) => setTimeout(r, 1000));
 
   // ✅ Unpublish the track if we have a publication SID; otherwise fall back gracefully
   try {
@@ -210,19 +214,30 @@ async function speakTextIntoRoom(room, text) {
       publication?.sid ??
       (typeof publication?.toJSON === "function" ? publication.toJSON()?.sid : undefined);
 
+    /*
     if (publicationSid) {
       await room.localParticipant.unpublishTrack(publicationSid, { stopOnUnpublish: true });
     } else {
       // some SDKs also accept the track object directly
       await room.localParticipant.unpublishTrack(track, { stopOnUnpublish: true });
     }
+    */
+    setTimeout(async () => {
+      try {
+        if (publicationSid) {
+          await room.localParticipant.unpublishTrack(publicationSid, { stopOnUnpublish: true });
+        } else {
+          await room.localParticipant.unpublishTrack(track, { stopOnUnpublish: true });
+        }
+        if (typeof track.stop === "function") track.stop();
+        if (typeof source.stop === "function") source.stop();
+      } catch (e) {
+        console.warn("delayed unpublishTrack failed:", e);
+      }
+    }, 1500);
   } catch (e) {
     console.warn("unpublishTrack failed (continuing anyway):", e);
   }
-
-  // Stop local resources regardless
-  if (typeof track.stop === "function") track.stop();
-  if (typeof source.stop === "function") source.stop();
 }
 
 async function llmReply(userText) {
@@ -404,6 +419,54 @@ app.post("/diag/tone", async (req, res) => {
 
     await room.disconnect();
     res.json({ ok: true, roomName, freq, durationSec });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// 🔇 Publish 3s of silence to verify subscription/subscription timing
+app.post("/diag/silence", async (req, res) => {
+  try {
+    const roomName = req.body?.roomName || process.env.DEFAULT_ROOM || "default";
+    const durationSec = Number(req.body?.durationSec ?? 3);
+    const rate = 48000;
+    const frameMs = 20;
+    const samplesPerFrame = Math.floor(rate * frameMs / 1000);
+    const totalFrames = Math.ceil((durationSec * 1000) / frameMs);
+
+    const room = await connectToRoom(roomName);
+
+    const source = new AudioSource(rate, 1);
+    const track = LocalAudioTrack.createAudioTrack("avatar-silence", source);
+    const opts = new TrackPublishOptions();
+    opts.source = TrackSource.SOURCE_MICROPHONE;
+    const publication = await room.localParticipant.publishTrack(track, opts);
+
+    for (let i = 0; i < totalFrames; i++) {
+      const pcm = new Int16Array(samplesPerFrame); // all zeros = silence
+      const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+      const frame = new AudioFrame(buf, rate, 1, samplesPerFrame);
+      await source.captureFrame(frame);
+    }
+
+    // keep it around a bit more, then clean up
+    await new Promise(r => setTimeout(r, 1000));
+
+    const publicationSid =
+      publication?.trackSid ??
+      publication?.sid ??
+      (typeof publication?.toJSON === "function" ? publication.toJSON()?.sid : undefined);
+    if (publicationSid) {
+      await room.localParticipant.unpublishTrack(publicationSid, { stopOnUnpublish: true });
+    } else {
+      await room.localParticipant.unpublishTrack(track, { stopOnUnpublish: true });
+    }
+    if (typeof track.stop === "function") track.stop();
+    if (typeof source.stop === "function") source.stop();
+
+    await room.disconnect();
+    res.json({ ok: true, roomName, durationSec });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e) });

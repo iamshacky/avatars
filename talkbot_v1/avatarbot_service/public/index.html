@@ -60,6 +60,8 @@
 
       room = new Room();
       await room.connect("wss://project1-5bgowgi3.livekit.cloud", token);
+      console.log("Viewer connected. my identity:", room.localParticipant?.identity);
+      room.participants.forEach((p) => console.log("Existing participant:", p.identity));
 
       room.on(RoomEvent.TrackSubscribed, (_track, pub, participant) => {
         if (pub.kind === "audio") {
@@ -74,6 +76,13 @@
           });
           animateMouth(mediaStream);
         }
+      });
+
+      room.on(RoomEvent.ParticipantConnected, (p) => {
+        console.log("Participant connected:", p.identity);
+      });
+      room.on(RoomEvent.ParticipantDisconnected, (p) => {
+        console.log("Participant disconnected:", p.identity);
       });
     }
 
