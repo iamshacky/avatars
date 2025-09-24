@@ -198,6 +198,18 @@
       }
     };
 
+    document.getElementById("testTone").onclick = async () => {
+      try {
+        const roomName = roomInput.value || "default";
+        // 20s @ 440Hz, same as your curl diag
+        const res = await postJSON("/diag/tone_hold", { roomName, holdMs: 20000, freq: 440 });
+        console.log("testTone ok", res);
+      } catch (e) {
+        console.error(e);
+        alert(e.message);
+      }
+    };
+
     document.getElementById("stayLeave").onclick = async () => {
       try {
         const res = await postJSON("/leave", {});
