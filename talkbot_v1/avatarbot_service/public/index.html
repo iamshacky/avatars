@@ -33,15 +33,22 @@
   </div>
 
   <script type="module">
-    // LiveKit client (ESM). Pin to a known-good version.
+    // LiveKit client (pin to a known good version)
     import { Room, RoomEvent } from "https://cdn.jsdelivr.net/npm/livekit-client@2.15.7/dist/livekit-client.esm.mjs";
 
-    // --- Config: same file works everywhere ---
-    // Use ?api=<baseUrl> to override the API base (useful for local viewing).
+    // --- Single-file, dual-environment config ---
     const params = new URLSearchParams(location.search);
     const API_OVERRIDE = params.get('api');
-    const BOT_BASE = API_OVERRIDE || location.origin; // Railway uses same-origin, local uses ?api=...
-    const BOT_AUTH = ""; // set if you enabled x-bot-auth middleware on the server
+    const DEFAULT_RAILWAY = "https://exciting-nourishment-production.up.railway.app";
+
+    // If ?api provided -> use it
+    // else if we're hosted on Railway -> same-origin
+    // else (likely localhost Apache) -> default to Railway backend
+    const onRailway = location.hostname.endsWith("railway.app");
+    const BOT_BASE = API_OVERRIDE || (onRailway ? location.origin : DEFAULT_RAILWAY);
+
+    // If you enabled the x-bot-auth guard on the server, put the secret here:
+    const BOT_AUTH = "";
 
     // --- Elements ---
     const audioEl = document.getElementById("audio");
@@ -117,7 +124,7 @@
       await room.connect("wss://project1-5bgowgi3.livekit.cloud", token);
       console.log("Viewer connected. my identity:", room.localParticipant?.identity);
 
-      // v2 uses remoteParticipants (Map). Fallback to participants if needed.
+      // v2: remoteParticipants is a Map; fallback if needed
       try {
         const map = room.remoteParticipants || room.participants;
         map && map.forEach?.((p) => console.log("[LK] Existing participant:", p.identity));
