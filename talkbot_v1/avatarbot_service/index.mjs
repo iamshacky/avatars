@@ -255,7 +255,8 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   const frameMs = 20;
   const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000);
 
-  for (let i = 0; i < Math.ceil(600 / frameMs); i++) {
+  // PRE-ROLL silence (↑ 1500ms) so subscribers attach before first phoneme
+  for (let i = 0; i < Math.ceil(1500 / frameMs); i++) {
     const pcm = new Int16Array(samplesPerFrame);
     const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
     const frame = new AudioFrame(buf, sampleRate, 1, samplesPerFrame);
@@ -265,6 +266,16 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   // actual TTS frames
   for (const f of frames) {
     const frame = new AudioFrame(f.buf, f.sampleRate, f.numChannels, f.samplesPerChannel);
+    await source.captureFrame(frame);
+  }
+
+  // quick RMS sanity (keep your block here)
+
+  // TAIL silence (↑ 3000ms) so late subscribers still hear the ending
+  for (let i = 0; i < Math.ceil(3000 / frameMs); i++) {
+    const pcm = new Int16Array(samplesPerFrame);
+    const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    const frame = new AudioFrame(buf, sampleRate, 1, samplesPerFrame);
     await source.captureFrame(frame);
   }
 
@@ -355,11 +366,13 @@ let persistent = null; // { room: Room, roomName: string }
 // Prevent overlapping speaks from colliding / crashing the process
 let speakQueue = Promise.resolve();
 function enqueueSpeak(fn) {
+  // `fn` must be an async function
   speakQueue = speakQueue.then(fn).catch((e) => {
     console.warn("speakQueue task error:", e?.message || e);
   });
   return speakQueue;
 }
+
 
 app.post("/join", async (req, res) => {
   const roomName = req.body?.roomName || DEFAULT_ROOM;
@@ -400,39 +413,36 @@ app.post("/message", async (req, res) => {
     const reply = await llmReply(textIn);
     console.log("LLM ms:", Date.now() - t0);
 
-    // fire-and-forget speaking to reduce client-perceived latency
-    (async () => {
-      try {
-        if (mode === "PERSISTENT") {
-          const room = await ensurePersistentRoom(roomName);
+    // enqueue the speak so HTTP returns immediately (no 502s)
+    const roomName0 = roomName;
+    if (mode === "PERSISTENT") {
+      enqueueSpeak(async () => {
+        const room = await ensurePersistentRoom(roomName0);
+        console.log("PERSISTENT speak starting, identity:", room.localParticipant?.identity);
+        await speakTextIntoRoom(room, reply);
+        console.log("PERSISTENT speak done, identity:", room.localParticipant?.identity);
+      });
+    } else {
+      // TRANSIENT: unique identity, serialize, and keep room up a tad longer
+      const transientIdentity = `${BOT_IDENTITY}-t-${Math.random().toString(36).slice(2, 6)}`;
+      console.log("TRANSIENT speak queued, identity:", transientIdentity);
+
+      enqueueSpeak(async () => {
+        const room = await connectToRoom(roomName0, transientIdentity);
+        try {
+          console.log("TRANSIENT speak starting, identity:", room.localParticipant?.identity);
           await speakTextIntoRoom(room, reply);
-        } else {
-          // TRANSIENT: unique identity + serialized execution
-          const roomName0 = roomName;
-          const transientIdentity = `${BOT_IDENTITY}-t-${Math.random().toString(36).slice(2, 6)}`;
-          console.log("TRANSIENT speak queued, identity:", transientIdentity);
-
-          await enqueueSpeak(async () => {
-            const room = await connectToRoom(roomName0, transientIdentity);
-            try {
-              console.log("TRANSIENT speak starting, identity:", room.localParticipant?.identity);
-              await speakTextIntoRoom(room, reply);
-              console.log("TRANSIENT speak done, identity:", room.localParticipant?.identity);
-            } finally {
-              await new Promise((r) => setTimeout(r, 800));
-              await room.disconnect().catch(() => {});
-            }
-          });
-
-          // success (no fire-and-forget)
-          return res.json({ ok: true, reply, mode });
+          console.log("TRANSIENT speak done, identity:", room.localParticipant?.identity);
+          // keep the participant around briefly so late subscribers attach
+          await new Promise((r) => setTimeout(r, 2000)); // was 800ms
+        } finally {
+          await room.disconnect().catch(() => {});
         }
-      } catch (e) {
-        console.warn("speak task failed:", e?.message || e);
-      }
-    })();
+      });
+    }
 
-    res.json({ ok: true, reply, mode });
+    // respond right away
+    return res.json({ ok: true, reply, mode });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e) });
