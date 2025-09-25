@@ -252,6 +252,13 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   // pre-roll silence (~600ms) so subscribers attach before first phoneme
   const frameMs = 20;
   const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000);
+
+  console.log("About to publish frames", {
+    totalFrames: frames.length,
+    sampleRate,
+    samplesPerFrame: Math.floor((sampleRate * 20) / 1000),
+  });
+
   for (let i = 0; i < Math.ceil(600 / frameMs); i++) {
     const pcm = new Int16Array(samplesPerFrame);
     const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
@@ -264,6 +271,21 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
     const frame = new AudioFrame(f.buf, f.sampleRate, f.numChannels, f.samplesPerChannel);
     await source.captureFrame(frame);
   }
+
+  // quick sanity: estimate RMS amplitude of the last frame (int16)
+  try {
+    const last = frames[frames.length - 1];
+    if (last?.buf?.byteLength) {
+      const i16 = new Int16Array(last.buf.buffer, last.buf.byteOffset, last.buf.byteLength / 2);
+      let sum = 0;
+      for (let i = 0; i < i16.length; i++) {
+        const v = i16[i] / 32768;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / i16.length);
+      console.log("Last-frame RMS (0..1):", rms.toFixed(4));
+    }
+  } catch {}
 
   // tail silence (~1500ms) so late subscribers still play ending cleanly
   for (let i = 0; i < Math.ceil(1500 / frameMs); i++) {
@@ -383,10 +405,16 @@ app.post("/message", async (req, res) => {
           const room = await ensurePersistentRoom(roomName);
           await speakTextIntoRoom(room, reply);
         } else {
+          const transientIdentity = `${BOT_IDENTITY}-t-${Math.random().toString(36).slice(2, 6)}`;
           const room = await connectToRoom(roomName);
-          await speakTextIntoRoom(room, reply);
-          await new Promise((r) => setTimeout(r, 800)); // small grace
-          await room.disconnect();
+
+          try {
+            await speakTextIntoRoom(room, reply);
+          } finally {
+            // graceful disconnect after a brief tail grace
+            await new Promise((r) => setTimeout(r, 800));
+            await room.disconnect().catch(() => {});
+          }
         }
       } catch (e) {
         console.warn("speak task failed:", e?.message || e);
@@ -598,6 +626,38 @@ app.post("/diag/silence_hold", async (req, res) => {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
+
+// Audition the TTS WAV directly in the browser: /diag/tts.wav?text=Hello
+app.get("/diag/tts.wav", async (req, res) => {
+  try {
+    const text = String(req.query.text || "This is a test.");
+    const wavBuf = await ttsWavFromOpenAI(text);
+    res.type("audio/wav").send(wavBuf);
+  } catch (e) {
+    console.error("diag/tts.wav error:", e);
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// On the client, your postJSON throws “Failed to fetch” for any network failure. Keep that, but add a quick console hint on why (status code, if available). This will show you r.status (e.g., 401/429/502) if it wasn’t a pure network drop.
+async function postJSON(path, body) {
+  const headers = { "content-type": "application/json" };
+  if (BOT_AUTH) headers["x-bot-auth"] = BOT_AUTH;
+
+  try {
+    const r = await fetch(BOT_BASE + path, { method: "POST", headers, body: JSON.stringify(body) });
+    let t = ""; try { t = await r.text(); } catch {}
+    let j; try { j = t ? JSON.parse(t) : null; } catch {}
+    if (!r.ok) {
+      console.error("POST failed", path, r.status, t);
+      throw new Error(`${path} ${r.status}: ${t || "request failed"}`);
+    }
+    return j ?? {};
+  } catch (err) {
+    console.error("Network error calling", path, err);
+    throw err;
+  }
+}
 
 // ── START ─────────────────────────────────────────────────────────────────────
 const port = process.env.PORT || 8080;
