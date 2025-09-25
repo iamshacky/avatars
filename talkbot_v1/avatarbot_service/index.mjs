@@ -1,6 +1,5 @@
 import "dotenv/config";
 import express from "express";
-import fetch from "node-fetch";
 import cors from "cors";
 import OpenAI from "openai";
 import { AccessToken } from "livekit-server-sdk";
@@ -24,10 +23,12 @@ const {
   LIVEKIT_API_KEY,
   LIVEKIT_API_SECRET,
   OPENAI_API_KEY,
-  PIPER_URL,
   DEFAULT_ROOM = "default",
   BOT_IDENTITY = "AvatarBot_1",
   BOT_MODE = "TRANSIENT", // or PERSISTENT
+  OPENAI_TTS_MODEL = "gpt-4o-mini-tts",
+  OPENAI_TTS_VOICE = "alloy",
+  CLIENT_TOKEN_TTL_MIN = 60,
 } = process.env;
 
 if (!LIVEKIT_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
@@ -38,10 +39,8 @@ if (!OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY.");
   process.exit(1);
 }
-if (!PIPER_URL) {
-  console.error("Missing PIPER_URL.");
-  process.exit(1);
-}
+
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // ── APP & STATIC ──────────────────────────────────────────────────────────────
 const app = express();
@@ -59,7 +58,7 @@ app.get("/__debug/files", (_req, res) => {
   res.json({ __dirname, pubDir, exists, listing });
 });
 
-// 🔐 shared-secret guard (optional)
+// 🔐 optional shared-secret guard
 app.use((req, res, next) => {
   const needsAuth =
     req.method === "POST" &&
@@ -69,8 +68,6 @@ app.use((req, res, next) => {
   if (!process.env.BOT_AUTH || provided === process.env.BOT_AUTH) return next();
   return res.status(401).json({ ok: false, error: "unauthorized" });
 });
-
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 // ── LIVEKIT HELPERS ───────────────────────────────────────────────────────────
 function mintServerToken({ roomName, identity, canPublish = true }) {
@@ -87,18 +84,10 @@ function mintServerToken({ roomName, identity, canPublish = true }) {
   return at.toJwt();
 }
 
-// Add lightweight state flags on the Room we return
 function wireRoom(room) {
   room.__lkState = { connected: true, lastError: null };
-
-  room.on?.("connected", () => {
-    room.__lkState.connected = true;
-    console.log("LK room connected");
-  });
-  room.on?.("disconnected", () => {
-    room.__lkState.connected = false;
-    console.log("LK room disconnected");
-  });
+  room.on?.("connected", () => { room.__lkState.connected = true; console.log("LK room connected"); });
+  room.on?.("disconnected", () => { room.__lkState.connected = false; console.log("LK room disconnected"); });
   room.on?.("reconnecting", () => console.log("LK room reconnecting"));
   room.on?.("reconnected", () => console.log("LK room reconnected"));
   room.on?.("connectionStateChanged", (s) => console.log("LK conn state:", s));
@@ -106,17 +95,14 @@ function wireRoom(room) {
   room.on?.("participantDisconnected", (p) => console.log("LK participant-", p?.identity));
   room.on?.("trackPublished", (pub) => console.log("LK trackPublished", pub?.trackSid || pub?.sid || pub?.trackName));
   room.on?.("trackUnpublished", (pub) => console.log("LK trackUnpublished", pub?.trackSid || pub?.sid || pub?.trackName));
-  room.on?.("engineError", (e) => {
-    room.__lkState.lastError = e;
-    console.warn("LK engineError:", e?.message || String(e));
-  });
-
+  room.on?.("engineError", (e) => { room.__lkState.lastError = e; console.warn("LK engineError:", e?.message || String(e)); });
   return room;
 }
 
 async function connectToRoom(roomName, identity = BOT_IDENTITY) {
   const room = new Room();
   const token = await mintServerToken({ roomName, identity, canPublish: true });
+  console.log("Connecting to LiveKit", { url: LIVEKIT_URL, room: roomName, identity });
   await room.connect(LIVEKIT_URL, token);
   wireRoom(room);
   console.log("Connected to LiveKit", { roomName, identity });
@@ -125,7 +111,6 @@ async function connectToRoom(roomName, identity = BOT_IDENTITY) {
 
 function isRoomUsable(room) {
   if (!room) return false;
-  // Prefer our flag; fall back to truthy localParticipant as a heuristic
   if (room.__lkState && room.__lkState.connected) return true;
   return !!room.localParticipant;
 }
@@ -138,6 +123,10 @@ async function ensurePersistentRoom(roomName) {
 }
 
 async function safeUnpublish(room, publication, track) {
+  if (!room?.localParticipant?.unpublishTrack) {
+    console.warn("localParticipant.unpublishTrack not available");
+    return;
+  }
   const sid =
     publication?.trackSid ??
     publication?.sid ??
@@ -194,7 +183,7 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
     pcm16src[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
 
-  // resample to 48 kHz
+  // resample to 48 kHz if needed
   const dstRate = 48000;
   let pcm16 = pcm16src;
   let rate = srcRate;
@@ -226,7 +215,25 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
   return { frames, sampleRate: rate, channels: 1 };
 }
 
-// ── SPEAK: TTS → PUBLISH → DWELL → UNPUBLISH (with retry) ────────────────────
+// ── TTS (OpenAI) ─────────────────────────────────────────────────────────────
+async function ttsWavFromOpenAI(text) {
+  const t0 = Date.now();
+  const resp = await openai.audio.speech.create({
+    model: OPENAI_TTS_MODEL,        // e.g., "gpt-4o-mini-tts"
+    voice: OPENAI_TTS_VOICE,        // e.g., "alloy"
+    input: text,
+    response_format: "wav",          // <-- IMPORTANT
+  });
+  const wavBuf = Buffer.from(await resp.arrayBuffer());
+  const ms = Date.now() - t0;
+  console.log("TTS ms:", ms, "bytes:", wavBuf?.length || 0);
+  if (!wavBuf || wavBuf.length < 44) {
+    throw new Error("TTS returned empty/invalid WAV");
+  }
+  return wavBuf;
+}
+
+// ── SPEAK: TTS → PUBLISH → pre-roll → tail → UNPUBLISH ───────────────────────
 async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-audio") {
   const source = new AudioSource(sampleRate, 1);
   const track = LocalAudioTrack.createAudioTrack(trackName, source);
@@ -242,31 +249,43 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
     },
   });
 
+  // pre-roll silence (~600ms) so subscribers attach before first phoneme
+  const frameMs = 20;
+  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000);
+  for (let i = 0; i < Math.ceil(600 / frameMs); i++) {
+    const pcm = new Int16Array(samplesPerFrame);
+    const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    const frame = new AudioFrame(buf, sampleRate, 1, samplesPerFrame);
+    await source.captureFrame(frame);
+  }
+
+  // actual TTS frames
   for (const f of frames) {
     const frame = new AudioFrame(f.buf, f.sampleRate, f.numChannels, f.samplesPerChannel);
     await source.captureFrame(frame);
   }
 
-  await new Promise((r) => setTimeout(r, 1000)); // let subscribers attach & play
+  // tail silence (~1500ms) so late subscribers still play ending cleanly
+  for (let i = 0; i < Math.ceil(1500 / frameMs); i++) {
+    const pcm = new Int16Array(samplesPerFrame);
+    const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    const frame = new AudioFrame(buf, sampleRate, 1, samplesPerFrame);
+    await source.captureFrame(frame);
+  }
+
   await safeUnpublish(room, publication, track);
   try { if (typeof track.stop === "function") track.stop(); } catch {}
   try { if (typeof source.stop === "function") source.stop(); } catch {}
 }
 
 async function speakTextIntoRoom(roomOrName, text) {
-  // 1) Piper TTS to WAV
-  const tts = await fetch(`${PIPER_URL}/synthesize`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text }),
-  });
-  if (!tts.ok) throw new Error(`Piper error: ${tts.status}`);
-  const wavBuf = Buffer.from(await tts.arrayBuffer());
+  // 1) OpenAI TTS to WAV
+  const wavBuf = await ttsWavFromOpenAI(text);
 
   // 2) Decode → 48k frames
   const { frames, sampleRate } = await wavToInt16Frames(wavBuf, 20);
 
-  // 3) Ensure room and publish, with one retry if engine died
+  // 3) Ensure room and publish (retry only on engine death)
   let room = typeof roomOrName === "string" ? await ensurePersistentRoom(roomOrName) : roomOrName;
 
   try {
@@ -275,10 +294,7 @@ async function speakTextIntoRoom(roomOrName, text) {
     const msg = String(e || "");
     console.warn("publish failed, first attempt:", msg);
     if (msg.includes("engine is closed") || msg.includes("connection error")) {
-      // Reconnect and retry once
-      try {
-        await room.disconnect().catch(() => {});
-      } catch {}
+      try { await room.disconnect().catch(() => {}); } catch {}
       room = await connectToRoom(DEFAULT_ROOM);
       await publishFramesOnce(room, frames, sampleRate);
     } else {
@@ -292,7 +308,7 @@ async function llmReply(userText) {
   const res = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages: [
-      { role: "system", content: "You are AvatarBot: concise, friendly, YouTube-presenter energy. Keep answers under 15 seconds unless asked." },
+      { role: "system", content: "You are AvatarBot_1: concise, friendly, YouTube-presenter energy. Keep answers under 15 seconds unless asked." },
       { role: "user", content: userText },
     ],
   });
@@ -301,7 +317,7 @@ async function llmReply(userText) {
 
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 app.get("/healthz", (_req, res) => {
-  res.json({ ok: true, mode: process.env.BOT_MODE || BOT_MODE, room: DEFAULT_ROOM });
+  res.json({ ok: true, mode: process.env.BOT_MODE || BOT_MODE, room: DEFAULT_ROOM, tts: { provider: "openai", model: OPENAI_TTS_MODEL, voice: OPENAI_TTS_VOICE } });
 });
 
 app.get("/diag/state", (_req, res) => {
@@ -356,17 +372,26 @@ app.post("/message", async (req, res) => {
     : (process.env.BOT_MODE || BOT_MODE);
 
   try {
+    const t0 = Date.now();
     const reply = await llmReply(textIn);
+    console.log("LLM ms:", Date.now() - t0);
 
-    if (mode === "PERSISTENT") {
-      const room = await ensurePersistentRoom(roomName);
-      await speakTextIntoRoom(room, reply);
-    } else {
-      const room = await connectToRoom(roomName);
-      await speakTextIntoRoom(room, reply);
-      await new Promise((r) => setTimeout(r, 300)); // grace before disconnect
-      await room.disconnect();
-    }
+    // fire-and-forget speaking to reduce client-perceived latency
+    (async () => {
+      try {
+        if (mode === "PERSISTENT") {
+          const room = await ensurePersistentRoom(roomName);
+          await speakTextIntoRoom(room, reply);
+        } else {
+          const room = await connectToRoom(roomName);
+          await speakTextIntoRoom(room, reply);
+          await new Promise((r) => setTimeout(r, 800)); // small grace
+          await room.disconnect();
+        }
+      } catch (e) {
+        console.warn("speak task failed:", e?.message || e);
+      }
+    })();
 
     res.json({ ok: true, reply, mode });
   } catch (e) {
@@ -380,18 +405,13 @@ app.get("/token", async (req, res) => {
   try {
     const roomName = String(req.query.room || DEFAULT_ROOM || "default");
     const identity = String(req.query.user || "viewer-" + Math.random().toString(36).slice(2, 8));
-    const ttlMin = Number(process.env.CLIENT_TOKEN_TTL_MIN || 60);
+    const ttlMin = Number(CLIENT_TOKEN_TTL_MIN || 60);
 
     const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
       identity,
       ttl: `${ttlMin}m`,
     });
-    at.addGrant({
-      roomJoin: true,
-      room: roomName,
-      canPublish: false,
-      canSubscribe: true,
-    });
+    at.addGrant({ roomJoin: true, room: roomName, canPublish: false, canSubscribe: true });
     const jwt = await at.toJwt();
     res.type("text/plain").send(jwt);
   } catch (e) {
@@ -400,16 +420,23 @@ app.get("/token", async (req, res) => {
   }
 });
 
-// ── DIAGNOSTICS ───────────────────────────────────────────────────────────────
-app.get("/diag/piper", async (_req, res) => {
+// Simple TTS diag: returns { ok, bytes, ms } and serves the audio if you want to hear it
+app.get("/diag/tts", async (req, res) => {
   try {
-    const r = await fetch(`${PIPER_URL}/healthz`);
-    res.json({ ok: r.ok, status: r.status });
+    const text = String(req.query.text || "This is a test.");
+    const t0 = Date.now();
+    const wavBuf = await ttsWavFromOpenAI(text);
+    const ms = Date.now() - t0;
+    res.json({ ok: true, bytes: wavBuf.length, ms, model: OPENAI_TTS_MODEL, voice: OPENAI_TTS_VOICE });
+    // If you want to audition it in the browser instead, comment the line above and use:
+    // res.type("audio/wav").send(wavBuf);
   } catch (e) {
+    console.error("diag/tts error:", e);
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
+// ── DIAGNOSTICS (tone/silence helpers still useful) ──────────────────────────
 app.get("/diag/connect", async (_req, res) => {
   try {
     const room = await connectToRoom(DEFAULT_ROOM || "default");
@@ -468,7 +495,7 @@ app.post("/diag/tone", async (req, res) => {
   }
 });
 
-// long-hold tone (~20s) to guarantee subscription window
+// long-hold tone (~20s)
 app.post("/diag/tone_hold", async (req, res) => {
   try {
     const roomName = req.body?.roomName || DEFAULT_ROOM || "default";
@@ -476,7 +503,7 @@ app.post("/diag/tone_hold", async (req, res) => {
     const frameMs = 20;
     const samplesPerFrame = Math.floor((rate * frameMs) / 1000);
     const freq = Number(req.body?.freq ?? 440);
-    const holdMs = Number(req.body?.holdMs ?? 20000); // 20s
+    const holdMs = Number(req.body?.holdMs ?? 20000);
 
     const room = await connectToRoom(roomName);
 
@@ -506,7 +533,7 @@ app.post("/diag/tone_hold", async (req, res) => {
     setTimeout(async () => {
       try {
         running = false;
-        await new Promise((r) => setTimeout(r, 200)); // small drain
+        await new Promise((r) => setTimeout(r, 200));
         await safeUnpublish(room, publication, track);
         try { if (typeof track.stop === "function") track.stop(); } catch {}
         try { if (typeof source.stop === "function") source.stop(); } catch {}
@@ -544,7 +571,7 @@ app.post("/diag/silence_hold", async (req, res) => {
     let running = true;
     (async () => {
       while (running) {
-        const pcm = new Int16Array(samplesPerFrame); // zeros
+        const pcm = new Int16Array(samplesPerFrame);
         const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
         const frame = new AudioFrame(buf, rate, 1, samplesPerFrame);
         await source.captureFrame(frame);

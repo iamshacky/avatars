@@ -155,7 +155,7 @@
     document.getElementById("speakOnce").onclick = async () => {
       try {
         const roomName = roomInput.value || "default";
-        const text = document.getElementById("msg").value || "Hello from AvatarBot!";
+        const text = document.getElementById("msg").value || "Hello from AvatarBot_1!";
         const res = await postJSON("/message", { roomName, text, keep: false });
         console.log("speakOnce ok", res);
       } catch (e) { console.error(e); alert(e.message); }
