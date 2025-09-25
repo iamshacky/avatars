@@ -105,7 +105,7 @@ async function connectToRoom(roomName, identity = BOT_IDENTITY) {
   console.log("Connecting to LiveKit", { url: LIVEKIT_URL, room: roomName, identity });
   await room.connect(LIVEKIT_URL, token);
   wireRoom(room);
-  console.log("Connected to LiveKit", { roomName, identity });
+  console.log("Connected to LiveKit", { roomName, identity: room.localParticipant?.identity });
   return room;
 }
 
@@ -248,16 +248,23 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
       name: publication?.trackName || trackName,
     },
   });
+  console.log("About to publish frames", {
+    by: room?.localParticipant?.identity,
+    totalFrames: frames.length,
+    sampleRate,
+    samplesPerFrame: Math.floor((sampleRate * 20) / 1000),
+  });
 
   // pre-roll silence (~600ms) so subscribers attach before first phoneme
-  const frameMs = 20;
-  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000);
 
   console.log("About to publish frames", {
     totalFrames: frames.length,
     sampleRate,
     samplesPerFrame: Math.floor((sampleRate * 20) / 1000),
   });
+
+  const frameMs = 20;
+  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000);
 
   for (let i = 0; i < Math.ceil(600 / frameMs); i++) {
     const pcm = new Int16Array(samplesPerFrame);
@@ -278,10 +285,7 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
     if (last?.buf?.byteLength) {
       const i16 = new Int16Array(last.buf.buffer, last.buf.byteOffset, last.buf.byteLength / 2);
       let sum = 0;
-      for (let i = 0; i < i16.length; i++) {
-        const v = i16[i] / 32768;
-        sum += v * v;
-      }
+      for (let i = 0; i < i16.length; i++) { const v = i16[i] / 32768; sum += v * v; }
       const rms = Math.sqrt(sum / i16.length);
       console.log("Last-frame RMS (0..1):", rms.toFixed(4));
     }
@@ -405,14 +409,15 @@ app.post("/message", async (req, res) => {
           const room = await ensurePersistentRoom(roomName);
           await speakTextIntoRoom(room, reply);
         } else {
+          // TRANSIENT: connect with a short-lived unique identity to avoid collisions
           const transientIdentity = `${BOT_IDENTITY}-t-${Math.random().toString(36).slice(2, 6)}`;
-          const room = await connectToRoom(roomName);
+          console.log("TRANSIENT speak using identity:", transientIdentity);
 
+          const room = await connectToRoom(roomName, transientIdentity);
           try {
             await speakTextIntoRoom(room, reply);
           } finally {
-            // graceful disconnect after a brief tail grace
-            await new Promise((r) => setTimeout(r, 800));
+            await new Promise((r) => setTimeout(r, 800)); // small tail grace
             await room.disconnect().catch(() => {});
           }
         }
