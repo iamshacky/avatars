@@ -11,7 +11,7 @@ import {
   TrackSource,
   AudioFrame,
 } from "@livekit/rtc-node";
-import { decode } from "node-wav";
+//import { decode } from "node-wav";
 
 import fs from "fs";
 import path from "path";
@@ -156,72 +156,96 @@ async function safeUnpublish(room, publication, track) {
   console.warn("unpublishTrack: all signatures failed; continuing", lastErr?.message || lastErr);
 }
 
+function parseWavPCM16(buf) {
+  // Basic RIFF/WAVE checks
+  if (buf.length < 44) throw new Error("WAV too short");
+  if (buf.toString("ascii", 0, 4) !== "RIFF") throw new Error("Not RIFF");
+  if (buf.toString("ascii", 8, 12) !== "WAVE") throw new Error("Not WAVE");
+
+  let offset = 12;
+  let audioFormat = null;
+  let numChannels = null;
+  let sampleRate = null;
+  let bitsPerSample = null;
+  let dataStart = null;
+  let dataLen = null;
+
+  // Walk chunks
+  while (offset + 8 <= buf.length) {
+    const id = buf.toString("ascii", offset, offset + 4);
+    const size = buf.readUInt32LE(offset + 4);
+    const body = offset + 8;
+    if (id === "fmt ") {
+      if (size < 16) throw new Error("fmt chunk too small");
+      audioFormat = buf.readUInt16LE(body + 0);
+      numChannels = buf.readUInt16LE(body + 2);
+      sampleRate = buf.readUInt32LE(body + 4);
+      // skip byteRate (8..11) and blockAlign (12..13)
+      bitsPerSample = buf.readUInt16LE(body + 14);
+    } else if (id === "data") {
+      dataStart = body;
+      dataLen = size;
+      break; // prefer first data chunk
+    }
+    // Chunks are word-aligned; skip pad byte on odd sizes
+    offset = body + size + (size & 1);
+  }
+
+  if (audioFormat !== 1) throw new Error("WAV not PCM");
+  if (numChannels !== 1) throw new Error("WAV not mono");
+  if (bitsPerSample !== 16) throw new Error("WAV not 16-bit");
+  if (dataStart == null || dataLen == null) throw new Error("WAV missing data chunk");
+  if (dataStart + dataLen > buf.length) throw new Error("WAV data chunk truncated");
+
+  const pcm = buf.slice(dataStart, dataStart + dataLen);
+  const i16 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
+  return { sampleRate, i16 };
+}
+
+function resampleTo48kInt16(srcI16, srcRate) {
+  const dstRate = 48000;
+  if (srcRate === dstRate) return srcI16;
+  const ratio = dstRate / srcRate;
+  const dstLen = Math.max(1, Math.round(srcI16.length * ratio));
+  const out = new Int16Array(dstLen);
+  for (let i = 0; i < dstLen; i++) {
+    const x = i / ratio;
+    const i0 = Math.floor(x);
+    const i1 = Math.min(i0 + 1, srcI16.length - 1);
+    const s0 = srcI16[i0];
+    const s1 = srcI16[i1];
+    const frac = x - i0;
+    out[i] = s0 + (s1 - s0) * frac;
+  }
+  return out;
+}
+
 // ── AUDIO: WAV → 48k PCM FRAMES ───────────────────────────────────────────────
 async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
-  const { sampleRate: srcRate, channelData } = await decode(wavBuf);
-  const channels = channelData.length;
-  const ch0 = channelData[0];
+  const { sampleRate: srcRate, i16 } = parseWavPCM16(wavBuf);
 
-  // downmix to mono if needed
-  let mono;
-  if (channels === 1) {
-    mono = ch0;
-  } else {
-    const len = channelData[0].length;
-    mono = new Float32Array(len);
-    for (let i = 0; i < len; i++) {
-      let acc = 0;
-      for (let c = 0; c < channels; c++) acc += channelData[c][i];
-      mono[i] = acc / channels;
-    }
-  }
+  // resample to 48k if needed (Int16 -> Int16)
+  const i16_48k = resampleTo48kInt16(i16, srcRate);
 
-  // float32 → int16
-  const pcm16src = new Int16Array(mono.length);
-  for (let i = 0; i < mono.length; i++) {
-    const s = Math.max(-1, Math.min(1, mono[i]));
-    pcm16src[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-
-  // resample to 48 kHz if needed (linear)
-  const dstRate = 48000;
-  let pcm16 = pcm16src;
-  if (srcRate !== dstRate) {
-    const ratio = dstRate / srcRate;
-    const dstLen = Math.round(pcm16src.length * ratio);
-    const out = new Int16Array(dstLen);
-    for (let i = 0; i < dstLen; i++) {
-      const srcIndex = i / ratio;
-      const i0 = Math.floor(srcIndex);
-      const i1 = Math.min(i0 + 1, pcm16src.length - 1);
-      const frac = srcIndex - i0;
-      const s0 = pcm16src[i0];
-      const s1 = pcm16src[i1];
-      out[i] = s0 + (s1 - s0) * frac;
-    }
-    pcm16 = out;
-  }
-
-  // frame into EXACT 20ms chunks (pad last frame with zeros)
-  const samplesPerFrame = Math.floor((dstRate * desiredFrameMs) / 1000); // 960 @ 48k
+  // frame into EXACT 20ms chunks, pad last frame with zeros
+  const rate = 48000;
+  const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000); // 960 @ 48k
   const frames = [];
-  for (let offset = 0; offset < pcm16.length; offset += samplesPerFrame) {
-    const remain = Math.min(samplesPerFrame, pcm16.length - offset);
-    const slice = pcm16.subarray(offset, offset + remain);
+
+  for (let offset = 0; offset < i16_48k.length; offset += samplesPerFrame) {
+    const remain = Math.min(samplesPerFrame, i16_48k.length - offset);
     let block;
     if (remain === samplesPerFrame) {
-      // full frame
-      block = slice;
+      block = i16_48k.subarray(offset, offset + samplesPerFrame);
     } else {
-      // pad last frame to full length
       block = new Int16Array(samplesPerFrame);
-      block.set(slice, 0);
+      block.set(i16_48k.subarray(offset, offset + remain), 0);
     }
     const buf = Buffer.from(block.buffer, block.byteOffset, block.byteLength);
-    frames.push({ buf, sampleRate: dstRate, samplesPerChannel: samplesPerFrame, numChannels: 1 });
+    frames.push({ buf, sampleRate: rate, samplesPerChannel: samplesPerFrame, numChannels: 1 });
   }
 
-  return { frames, sampleRate: dstRate, channels: 1 };
+  return { frames, sampleRate: rate, channels: 1 };
 }
 
 // ── TTS (OpenAI) ─────────────────────────────────────────────────────────────
