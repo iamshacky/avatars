@@ -311,26 +311,23 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
 }
 
 async function speakTextIntoRoom(roomOrName, text, opts = {}) {
-  // opts: { roomName?: string, identity?: string }
-  const wavBuf = await ttsWavFromOpenAI(text);
-  const { frames, sampleRate } = await wavToInt16Frames(wavBuf, 20);
-
-  let room = typeof roomOrName === "string" ? await ensurePersistentRoom(roomOrName) : roomOrName;
-  const targetRoomName = typeof roomOrName === "string" ? roomOrName : (opts.roomName || DEFAULT_ROOM);
-  const targetIdentity = typeof roomOrName === "string" ? BOT_IDENTITY : (opts.identity || room?.localParticipant?.identity || BOT_IDENTITY);
-
+  console.log("[speakTextIntoRoom] entered with text:", text.slice(0,50));
   try {
+    const wavBuf = await ttsWavFromOpenAI(text);
+    console.log("[speakTextIntoRoom] got wavBuf len:", wavBuf.length);
+    const { frames, sampleRate } = await wavToInt16Frames(wavBuf, 20);
+    console.log("[speakTextIntoRoom] got frames:", frames.length, "sr:", sampleRate);
+
+    let room = typeof roomOrName === "string"
+      ? await ensurePersistentRoom(roomOrName)
+      : roomOrName;
+    console.log("[speakTextIntoRoom] using room:", room?.localParticipant?.identity);
+
     await publishFramesOnce(room, frames, sampleRate);
+    console.log("[speakTextIntoRoom] publishFramesOnce finished");
   } catch (e) {
-    const msg = String(e || "");
-    console.warn("publish failed, first attempt:", msg);
-    if (msg.includes("engine is closed") || msg.includes("connection error")) {
-      try { await room.disconnect().catch(() => {}); } catch {}
-      room = await connectToRoom(targetRoomName, targetIdentity);
-      await publishFramesOnce(room, frames, sampleRate);
-    } else {
-      throw e;
-    }
+    console.error("[speakTextIntoRoom] error:", e);
+    throw e;
   }
 }
 
