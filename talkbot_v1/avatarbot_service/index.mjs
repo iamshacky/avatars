@@ -219,17 +219,14 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
 async function ttsWavFromOpenAI(text) {
   const t0 = Date.now();
   const resp = await openai.audio.speech.create({
-    model: OPENAI_TTS_MODEL,        // e.g., "gpt-4o-mini-tts"
-    voice: OPENAI_TTS_VOICE,        // e.g., "alloy"
+    model: OPENAI_TTS_MODEL,
+    voice: OPENAI_TTS_VOICE,
     input: text,
-    response_format: "wav",          // <-- IMPORTANT
+    response_format: "wav",
   });
   const wavBuf = Buffer.from(await resp.arrayBuffer());
-  const ms = Date.now() - t0;
-  console.log("TTS ms:", ms, "bytes:", wavBuf?.length || 0);
-  if (!wavBuf || wavBuf.length < 44) {
-    throw new Error("TTS returned empty/invalid WAV");
-  }
+  console.log("TTS ms:", Date.now() - t0, "bytes:", wavBuf?.length || 0);
+  if (!wavBuf || wavBuf.length < 44) throw new Error("TTS returned empty/invalid WAV");
   return wavBuf;
 }
 
@@ -250,14 +247,6 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   });
   console.log("About to publish frames", {
     by: room?.localParticipant?.identity,
-    totalFrames: frames.length,
-    sampleRate,
-    samplesPerFrame: Math.floor((sampleRate * 20) / 1000),
-  });
-
-  // pre-roll silence (~600ms) so subscribers attach before first phoneme
-
-  console.log("About to publish frames", {
     totalFrames: frames.length,
     sampleRate,
     samplesPerFrame: Math.floor((sampleRate * 20) / 1000),
@@ -363,6 +352,15 @@ app.post("/mode", (req, res) => {
 
 let persistent = null; // { room: Room, roomName: string }
 
+// Prevent overlapping speaks from colliding / crashing the process
+let speakQueue = Promise.resolve();
+function enqueueSpeak(fn) {
+  speakQueue = speakQueue.then(fn).catch((e) => {
+    console.warn("speakQueue task error:", e?.message || e);
+  });
+  return speakQueue;
+}
+
 app.post("/join", async (req, res) => {
   const roomName = req.body?.roomName || DEFAULT_ROOM;
   try {
@@ -409,17 +407,25 @@ app.post("/message", async (req, res) => {
           const room = await ensurePersistentRoom(roomName);
           await speakTextIntoRoom(room, reply);
         } else {
-          // TRANSIENT: connect with a short-lived unique identity to avoid collisions
+          // TRANSIENT: unique identity + serialized execution
+          const roomName0 = roomName;
           const transientIdentity = `${BOT_IDENTITY}-t-${Math.random().toString(36).slice(2, 6)}`;
-          console.log("TRANSIENT speak using identity:", transientIdentity);
+          console.log("TRANSIENT speak queued, identity:", transientIdentity);
 
-          const room = await connectToRoom(roomName, transientIdentity);
-          try {
-            await speakTextIntoRoom(room, reply);
-          } finally {
-            await new Promise((r) => setTimeout(r, 800)); // small tail grace
-            await room.disconnect().catch(() => {});
-          }
+          await enqueueSpeak(async () => {
+            const room = await connectToRoom(roomName0, transientIdentity);
+            try {
+              console.log("TRANSIENT speak starting, identity:", room.localParticipant?.identity);
+              await speakTextIntoRoom(room, reply);
+              console.log("TRANSIENT speak done, identity:", room.localParticipant?.identity);
+            } finally {
+              await new Promise((r) => setTimeout(r, 800));
+              await room.disconnect().catch(() => {});
+            }
+          });
+
+          // success (no fire-and-forget)
+          return res.json({ ok: true, reply, mode });
         }
       } catch (e) {
         console.warn("speak task failed:", e?.message || e);
@@ -644,25 +650,6 @@ app.get("/diag/tts.wav", async (req, res) => {
   }
 });
 
-// On the client, your postJSON throws “Failed to fetch” for any network failure. Keep that, but add a quick console hint on why (status code, if available). This will show you r.status (e.g., 401/429/502) if it wasn’t a pure network drop.
-async function postJSON(path, body) {
-  const headers = { "content-type": "application/json" };
-  if (BOT_AUTH) headers["x-bot-auth"] = BOT_AUTH;
-
-  try {
-    const r = await fetch(BOT_BASE + path, { method: "POST", headers, body: JSON.stringify(body) });
-    let t = ""; try { t = await r.text(); } catch {}
-    let j; try { j = t ? JSON.parse(t) : null; } catch {}
-    if (!r.ok) {
-      console.error("POST failed", path, r.status, t);
-      throw new Error(`${path} ${r.status}: ${t || "request failed"}`);
-    }
-    return j ?? {};
-  } catch (err) {
-    console.error("Network error calling", path, err);
-    throw err;
-  }
-}
 
 // ── START ─────────────────────────────────────────────────────────────────────
 const port = process.env.PORT || 8080;
