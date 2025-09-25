@@ -238,6 +238,10 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   options.source = TrackSource.SOURCE_MICROPHONE;
 
   const publication = await room.localParticipant.publishTrack(track, options);
+
+  // Give the SFU a moment to announce the new track before frames start
+  await new Promise((r) => setTimeout(r, 150));
+
   console.log("Published audio track", {
     identity: room.localParticipant?.identity,
     publication: {
@@ -291,28 +295,19 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
     }
   } catch {}
 
-  // tail silence (~1500ms) so late subscribers still play ending cleanly
-  for (let i = 0; i < Math.ceil(1500 / frameMs); i++) {
-    const pcm = new Int16Array(samplesPerFrame);
-    const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-    const frame = new AudioFrame(buf, sampleRate, 1, samplesPerFrame);
-    await source.captureFrame(frame);
-  }
-
   await safeUnpublish(room, publication, track);
   try { if (typeof track.stop === "function") track.stop(); } catch {}
   try { if (typeof source.stop === "function") source.stop(); } catch {}
 }
 
-async function speakTextIntoRoom(roomOrName, text) {
-  // 1) OpenAI TTS to WAV
+async function speakTextIntoRoom(roomOrName, text, opts = {}) {
+  // opts: { roomName?: string, identity?: string }
   const wavBuf = await ttsWavFromOpenAI(text);
-
-  // 2) Decode → 48k frames
   const { frames, sampleRate } = await wavToInt16Frames(wavBuf, 20);
 
-  // 3) Ensure room and publish (retry only on engine death)
   let room = typeof roomOrName === "string" ? await ensurePersistentRoom(roomOrName) : roomOrName;
+  const targetRoomName = typeof roomOrName === "string" ? roomOrName : (opts.roomName || DEFAULT_ROOM);
+  const targetIdentity = typeof roomOrName === "string" ? BOT_IDENTITY : (opts.identity || room?.localParticipant?.identity || BOT_IDENTITY);
 
   try {
     await publishFramesOnce(room, frames, sampleRate);
@@ -321,7 +316,7 @@ async function speakTextIntoRoom(roomOrName, text) {
     console.warn("publish failed, first attempt:", msg);
     if (msg.includes("engine is closed") || msg.includes("connection error")) {
       try { await room.disconnect().catch(() => {}); } catch {}
-      room = await connectToRoom(DEFAULT_ROOM);
+      room = await connectToRoom(targetRoomName, targetIdentity);
       await publishFramesOnce(room, frames, sampleRate);
     } else {
       throw e;
@@ -419,7 +414,7 @@ app.post("/message", async (req, res) => {
       enqueueSpeak(async () => {
         const room = await ensurePersistentRoom(roomName0);
         console.log("PERSISTENT speak starting, identity:", room.localParticipant?.identity);
-        await speakTextIntoRoom(room, reply);
+        await speakTextIntoRoom(room, reply, { roomName: roomName0, identity: room.localParticipant?.identity });
         console.log("PERSISTENT speak done, identity:", room.localParticipant?.identity);
       });
     } else {
@@ -431,7 +426,7 @@ app.post("/message", async (req, res) => {
         const room = await connectToRoom(roomName0, transientIdentity);
         try {
           console.log("TRANSIENT speak starting, identity:", room.localParticipant?.identity);
-          await speakTextIntoRoom(room, reply);
+          await speakTextIntoRoom(room, reply, { roomName: roomName0, identity: transientIdentity });
           console.log("TRANSIENT speak done, identity:", room.localParticipant?.identity);
           // keep the participant around briefly so late subscribers attach
           await new Promise((r) => setTimeout(r, 2000)); // was 800ms
