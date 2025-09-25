@@ -156,8 +156,8 @@ async function safeUnpublish(room, publication, track) {
   console.warn("unpublishTrack: all signatures failed; continuing", lastErr?.message || lastErr);
 }
 
-function parseWavPCM16(buf) {
-  // Basic RIFF/WAVE checks
+function parseWav(buf) {
+  // Minimal RIFF/WAVE parser with chunk walk & clamping
   if (buf.length < 44) throw new Error("WAV too short");
   if (buf.toString("ascii", 0, 4) !== "RIFF") throw new Error("Not RIFF");
   if (buf.toString("ascii", 8, 12) !== "WAVE") throw new Error("Not WAVE");
@@ -170,36 +170,85 @@ function parseWavPCM16(buf) {
   let dataStart = null;
   let dataLen = null;
 
-  // Walk chunks
   while (offset + 8 <= buf.length) {
     const id = buf.toString("ascii", offset, offset + 4);
     const size = buf.readUInt32LE(offset + 4);
     const body = offset + 8;
+
     if (id === "fmt ") {
       if (size < 16) throw new Error("fmt chunk too small");
-      audioFormat = buf.readUInt16LE(body + 0);
+      audioFormat = buf.readUInt16LE(body + 0);   // 1=PCM, 3=IEEE float
       numChannels = buf.readUInt16LE(body + 2);
-      sampleRate = buf.readUInt32LE(body + 4);
-      // skip byteRate (8..11) and blockAlign (12..13)
+      sampleRate  = buf.readUInt32LE(body + 4);
       bitsPerSample = buf.readUInt16LE(body + 14);
     } else if (id === "data") {
       dataStart = body;
       dataLen = size;
-      break; // prefer first data chunk
+      break; // take first data chunk
     }
-    // Chunks are word-aligned; skip pad byte on odd sizes
+    // word align
     offset = body + size + (size & 1);
   }
 
-  if (audioFormat !== 1) throw new Error("WAV not PCM");
-  if (numChannels !== 1) throw new Error("WAV not mono");
-  if (bitsPerSample !== 16) throw new Error("WAV not 16-bit");
-  if (dataStart == null || dataLen == null) throw new Error("WAV missing data chunk");
-  if (dataStart + dataLen > buf.length) throw new Error("WAV data chunk truncated");
+  if (!audioFormat || !numChannels || !sampleRate || !bitsPerSample) {
+    throw new Error("WAV missing fmt fields");
+  }
+  if (dataStart == null || dataLen == null) {
+    throw new Error("WAV missing data chunk");
+  }
 
-  const pcm = buf.slice(dataStart, dataStart + dataLen);
-  const i16 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.byteLength / 2);
-  return { sampleRate, i16 };
+  // Clamp if encoder lied about size
+  if (dataStart + dataLen > buf.length) {
+    dataLen = Math.max(0, buf.length - dataStart);
+  }
+
+  const dataBuf = buf.slice(dataStart, dataStart + dataLen);
+  return { audioFormat, numChannels, sampleRate, bitsPerSample, dataBuf };
+}
+
+function toMonoInt16({ audioFormat, numChannels, bitsPerSample, dataBuf }) {
+  // Support PCM16 (format=1, bps=16) and Float32 (format=3, bps=32)
+  if (audioFormat === 1 && bitsPerSample === 16) {
+    const i16 = new Int16Array(dataBuf.buffer, dataBuf.byteOffset, dataBuf.byteLength / 2);
+    if (numChannels === 1) return i16;
+
+    // downmix any N channels to mono (average)
+    const frames = Math.floor(i16.length / numChannels);
+    const out = new Int16Array(frames);
+    for (let f = 0; f < frames; f++) {
+      let acc = 0;
+      for (let c = 0; c < numChannels; c++) {
+        acc += i16[f * numChannels + c];
+      }
+      out[f] = acc / numChannels;
+    }
+    return out;
+  }
+
+  if (audioFormat === 3 && bitsPerSample === 32) {
+    const f32 = new Float32Array(dataBuf.buffer, dataBuf.byteOffset, dataBuf.byteLength / 4);
+    if (numChannels === 1) {
+      const out = new Int16Array(f32.length);
+      for (let i = 0; i < f32.length; i++) {
+        const s = Math.max(-1, Math.min(1, f32[i]));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return out;
+    }
+    const frames = Math.floor(f32.length / numChannels);
+    const out = new Int16Array(frames);
+    for (let f = 0; f < frames; f++) {
+      let acc = 0;
+      for (let c = 0; c < numChannels; c++) {
+        acc += f32[f * numChannels + c];
+      }
+      const s = Math.max(-1, Math.min(1, acc / numChannels));
+      out[f] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out;
+  }
+
+  throw new Error(`Unsupported WAV format: format=${audioFormat} bits=${bitsPerSample} ch=${numChannels}`);
 }
 
 function resampleTo48kInt16(srcI16, srcRate) {
@@ -214,22 +263,20 @@ function resampleTo48kInt16(srcI16, srcRate) {
     const i1 = Math.min(i0 + 1, srcI16.length - 1);
     const s0 = srcI16[i0];
     const s1 = srcI16[i1];
-    const frac = x - i0;
-    out[i] = s0 + (s1 - s0) * frac;
+    out[i] = s0 + (s1 - s0) * (x - i0);
   }
   return out;
 }
 
 // ── AUDIO: WAV → 48k PCM FRAMES ───────────────────────────────────────────────
 async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
-  const { sampleRate: srcRate, i16 } = parseWavPCM16(wavBuf);
+  const meta = parseWav(wavBuf);
+  const monoI16 = toMonoInt16(meta);
+  const i16_48k = resampleTo48kInt16(monoI16, meta.sampleRate);
 
-  // resample to 48k if needed (Int16 -> Int16)
-  const i16_48k = resampleTo48kInt16(i16, srcRate);
-
-  // frame into EXACT 20ms chunks, pad last frame with zeros
+  // 20ms framing with padding
   const rate = 48000;
-  const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000); // 960 @ 48k
+  const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000); // 960
   const frames = [];
 
   for (let offset = 0; offset < i16_48k.length; offset += samplesPerFrame) {
@@ -241,8 +288,12 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
       block = new Int16Array(samplesPerFrame);
       block.set(i16_48k.subarray(offset, offset + remain), 0);
     }
-    const buf = Buffer.from(block.buffer, block.byteOffset, block.byteLength);
-    frames.push({ buf, sampleRate: rate, samplesPerChannel: samplesPerFrame, numChannels: 1 });
+    frames.push({
+      buf: Buffer.from(block.buffer, block.byteOffset, block.byteLength),
+      sampleRate: rate,
+      samplesPerChannel: samplesPerFrame,
+      numChannels: 1
+    });
   }
 
   return { frames, sampleRate: rate, channels: 1 };
@@ -338,6 +389,11 @@ async function speakTextIntoRoom(roomOrName, text, opts = {}) {
   console.log("[speakTextIntoRoom] entered with text:", text.slice(0,50));
   try {
     const wavBuf = await ttsWavFromOpenAI(text);
+    try {
+      const dv = new DataView(wavBuf.buffer, wavBuf.byteOffset, Math.min(64, wavBuf.byteLength));
+      const tag = Buffer.from(wavBuf.slice(0, 12)).toString("ascii");
+      console.log("[tts header]", tag);
+    } catch {}
     console.log("[speakTextIntoRoom] got wavBuf len:", wavBuf.length);
     const { frames, sampleRate } = await wavToInt16Frames(wavBuf, 20);
     console.log("[speakTextIntoRoom] got frames:", frames.length, "sr:", sampleRate);
