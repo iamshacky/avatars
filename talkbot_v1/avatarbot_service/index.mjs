@@ -183,10 +183,9 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
     pcm16src[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
 
-  // resample to 48 kHz if needed
+  // resample to 48 kHz if needed (linear)
   const dstRate = 48000;
   let pcm16 = pcm16src;
-  let rate = srcRate;
   if (srcRate !== dstRate) {
     const ratio = dstRate / srcRate;
     const dstLen = Math.round(pcm16src.length * ratio);
@@ -201,18 +200,28 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
       out[i] = s0 + (s1 - s0) * frac;
     }
     pcm16 = out;
-    rate = dstRate;
   }
 
-  // frame into 20ms chunks
-  const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000); // 960 @ 48kHz
+  // frame into EXACT 20ms chunks (pad last frame with zeros)
+  const samplesPerFrame = Math.floor((dstRate * desiredFrameMs) / 1000); // 960 @ 48k
   const frames = [];
   for (let offset = 0; offset < pcm16.length; offset += samplesPerFrame) {
-    const slice = pcm16.subarray(offset, Math.min(offset + samplesPerFrame, pcm16.length));
-    const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-    frames.push({ buf, sampleRate: rate, samplesPerChannel: slice.length, numChannels: 1 });
+    const remain = Math.min(samplesPerFrame, pcm16.length - offset);
+    const slice = pcm16.subarray(offset, offset + remain);
+    let block;
+    if (remain === samplesPerFrame) {
+      // full frame
+      block = slice;
+    } else {
+      // pad last frame to full length
+      block = new Int16Array(samplesPerFrame);
+      block.set(slice, 0);
+    }
+    const buf = Buffer.from(block.buffer, block.byteOffset, block.byteLength);
+    frames.push({ buf, sampleRate: dstRate, samplesPerChannel: samplesPerFrame, numChannels: 1 });
   }
-  return { frames, sampleRate: rate, channels: 1 };
+
+  return { frames, sampleRate: dstRate, channels: 1 };
 }
 
 // ── TTS (OpenAI) ─────────────────────────────────────────────────────────────
@@ -238,9 +247,7 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   options.source = TrackSource.SOURCE_MICROPHONE;
 
   const publication = await room.localParticipant.publishTrack(track, options);
-
-  // Give the SFU a moment to announce the new track before frames start
-  await new Promise((r) => setTimeout(r, 150));
+  await new Promise((r) => setTimeout(r, 150)); // let SFU announce track
 
   console.log("Published audio track", {
     identity: room.localParticipant?.identity,
@@ -249,41 +256,39 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
       name: publication?.trackName || trackName,
     },
   });
+
+  const frameMs = 20;
+  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000);
   console.log("About to publish frames", {
     by: room?.localParticipant?.identity,
     totalFrames: frames.length,
     sampleRate,
-    samplesPerFrame: Math.floor((sampleRate * 20) / 1000),
+    samplesPerFrame,
   });
 
-  const frameMs = 20;
-  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000);
-
-  // PRE-ROLL silence (↑ 1500ms) so subscribers attach before first phoneme
-  for (let i = 0; i < Math.ceil(1500 / frameMs); i++) {
-    const pcm = new Int16Array(samplesPerFrame);
-    const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+  // helper: send one frame & wait the remainder of the 20ms slot
+  async function sendFrame(buf) {
+    const start = Date.now();
     const frame = new AudioFrame(buf, sampleRate, 1, samplesPerFrame);
     await source.captureFrame(frame);
+    const elapsed = Date.now() - start;
+    const wait = Math.max(0, frameMs - elapsed);
+    if (wait) await new Promise((r) => setTimeout(r, wait));
   }
 
-  // actual TTS frames
+  // PRE-ROLL silence (1500ms) paced at 20ms
+  const silent = new Int16Array(samplesPerFrame);
+  const silentBuf = Buffer.from(silent.buffer, silent.byteOffset, silent.byteLength);
+  for (let i = 0, n = Math.ceil(1500 / frameMs); i < n; i++) {
+    await sendFrame(silentBuf);
+  }
+
+  // SPEECH frames paced at 20ms
   for (const f of frames) {
-    const frame = new AudioFrame(f.buf, f.sampleRate, f.numChannels, f.samplesPerChannel);
-    await source.captureFrame(frame);
+    await sendFrame(f.buf);
   }
 
-  // quick RMS sanity (keep your block here)
-
-  // TAIL silence (↑ 3000ms) so late subscribers still hear the ending
-  for (let i = 0; i < Math.ceil(3000 / frameMs); i++) {
-    const pcm = new Int16Array(samplesPerFrame);
-    const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-    const frame = new AudioFrame(buf, sampleRate, 1, samplesPerFrame);
-    await source.captureFrame(frame);
-  }
-
-  // quick sanity: estimate RMS amplitude of the last frame (int16)
+  // quick RMS sanity on the last speech frame
   try {
     const last = frames[frames.length - 1];
     if (last?.buf?.byteLength) {
@@ -294,6 +299,11 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
       console.log("Last-frame RMS (0..1):", rms.toFixed(4));
     }
   } catch {}
+
+  // TAIL silence (3000ms) paced at 20ms
+  for (let i = 0, n = Math.ceil(3000 / frameMs); i < n; i++) {
+    await sendFrame(silentBuf);
+  }
 
   await safeUnpublish(room, publication, track);
   try { if (typeof track.stop === "function") track.stop(); } catch {}
