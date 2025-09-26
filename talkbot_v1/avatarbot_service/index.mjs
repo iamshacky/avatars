@@ -209,41 +209,40 @@ function parseWav(buf) {
 function toMonoInt16({ audioFormat, numChannels, bitsPerSample, dataBuf }) {
   // Support PCM16 (format=1, bps=16) and Float32 (format=3, bps=32)
   if (audioFormat === 1 && bitsPerSample === 16) {
-    const i16 = new Int16Array(dataBuf.buffer, dataBuf.byteOffset, dataBuf.byteLength / 2);
-    if (numChannels === 1) return i16;
-
-    // downmix any N channels to mono (average)
-    const frames = Math.floor(i16.length / numChannels);
+    const totalSamples = dataBuf.length / 2; // int16
+    const frames = Math.floor(totalSamples / numChannels);
     const out = new Int16Array(frames);
+    let o = 0;
+    let off = 0;
+
     for (let f = 0; f < frames; f++) {
       let acc = 0;
       for (let c = 0; c < numChannels; c++) {
-        acc += i16[f * numChannels + c];
+        const s = dataBuf.readInt16LE(off); // explicit little-endian
+        acc += s;
+        off += 2;
       }
-      out[f] = acc / numChannels;
+      out[o++] = (acc / numChannels) | 0;
     }
     return out;
   }
 
   if (audioFormat === 3 && bitsPerSample === 32) {
-    const f32 = new Float32Array(dataBuf.buffer, dataBuf.byteOffset, dataBuf.byteLength / 4);
-    if (numChannels === 1) {
-      const out = new Int16Array(f32.length);
-      for (let i = 0; i < f32.length; i++) {
-        const s = Math.max(-1, Math.min(1, f32[i]));
-        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-      }
-      return out;
-    }
-    const frames = Math.floor(f32.length / numChannels);
+    const totalSamples = dataBuf.length / 4; // float32
+    const frames = Math.floor(totalSamples / numChannels);
     const out = new Int16Array(frames);
+    let o = 0;
+    let off = 0;
+
     for (let f = 0; f < frames; f++) {
       let acc = 0;
       for (let c = 0; c < numChannels; c++) {
-        acc += f32[f * numChannels + c];
+        const s = dataBuf.readFloatLE(off); // explicit little-endian
+        acc += s;
+        off += 4;
       }
-      const s = Math.max(-1, Math.min(1, acc / numChannels));
-      out[f] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      const m = Math.max(-1, Math.min(1, acc / numChannels));
+      out[o++] = m < 0 ? m * 0x8000 : m * 0x7fff;
     }
     return out;
   }
@@ -271,6 +270,15 @@ function resampleTo48kInt16(srcI16, srcRate) {
 // ── AUDIO: WAV → 48k PCM FRAMES ───────────────────────────────────────────────
 async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
   const meta = parseWav(wavBuf);
+
+  console.log("[wav] fmt", {
+    format: meta.audioFormat,
+    ch: meta.numChannels,
+    sr: meta.sampleRate,
+    bps: meta.bitsPerSample,
+    bytes: meta.dataBuf?.length
+  });
+
   const monoI16 = toMonoInt16(meta);
   const i16_48k = resampleTo48kInt16(monoI16, meta.sampleRate);
 
