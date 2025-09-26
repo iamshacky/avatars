@@ -756,3 +756,4 @@ app.get("/diag/tts.wav", async (req, res) => {
 // ── START ─────────────────────────────────────────────────────────────────────
 const port = process.env.PORT || 8080;
 app.listen(port, () => console.log(`avatarbot_service listening on ${port}`));
+
