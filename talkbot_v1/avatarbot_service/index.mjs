@@ -322,67 +322,77 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   options.source = TrackSource.SOURCE_MICROPHONE;
 
   const publication = await room.localParticipant.publishTrack(track, options);
-  await new Promise((r) => setTimeout(r, 150)); // let SFU announce track
 
-  console.log("Published audio track", {
-    identity: room.localParticipant?.identity,
-    publication: {
-      sid: publication?.trackSid ?? publication?.sid,
-      name: publication?.trackName || trackName,
-    },
-  });
+  // Small grace so SFU announces the track before audio starts
+  await new Promise((r) => setTimeout(r, 120));
 
   const frameMs = 20;
-  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000);
+  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000); // 960 @ 48k
+
+  // Build a playlist: short pre-roll silence → actual TTS frames → short tail
+  const preMs = 400;   // try 200–600ms if you like
+  const tailMs = 600;  // try 400–1000ms if you like
+
+  const silentBlock = new Int16Array(samplesPerFrame);
+  const silentBuf = Buffer.from(silentBlock.buffer, silentBlock.byteOffset, silentBlock.byteLength);
+
+  // Wrap frames into a uniform descriptor
+  const playlist = [];
+
+  for (let i = 0; i < Math.ceil(preMs / frameMs); i++) {
+    playlist.push({ buf: silentBuf, samplesPerChannel: samplesPerFrame, silent: true });
+  }
+
+  for (const f of frames) {
+    playlist.push({ buf: f.buf, samplesPerChannel: f.samplesPerChannel, silent: false });
+  }
+
+  for (let i = 0; i < Math.ceil(tailMs / frameMs); i++) {
+    playlist.push({ buf: silentBuf, samplesPerChannel: samplesPerFrame, silent: true });
+  }
+
   console.log("About to publish frames", {
     by: room?.localParticipant?.identity,
-    totalFrames: frames.length,
+    totalFrames: playlist.length,
     sampleRate,
     samplesPerFrame,
   });
 
-  // helper: send one frame & wait the remainder of the 20ms slot
-  async function sendFrame(buf) {
-    const start = Date.now();
-    const frame = new AudioFrame(buf, sampleRate, 1, samplesPerFrame);
+  // Pace frames in real time (~20ms per frame)
+  const t0 = Date.now();
+  let i = 0;
+  for (const item of playlist) {
+    const frame = new AudioFrame(item.buf, sampleRate, 1, samplesPerFrame);
     await source.captureFrame(frame);
-    const elapsed = Date.now() - start;
-    const wait = Math.max(0, frameMs - elapsed);
-    if (wait) await new Promise((r) => setTimeout(r, wait));
+
+    // realtime pacing
+    const target = t0 + (++i * frameMs);
+    const wait = target - Date.now();
+    if (wait > 0) {
+      await new Promise((r) => setTimeout(r, wait));
+    }
   }
 
-  // PRE-ROLL silence (1500ms) paced at 20ms
-  const silent = new Int16Array(samplesPerFrame);
-  const silentBuf = Buffer.from(silent.buffer, silent.byteOffset, silent.byteLength);
-  for (let i = 0, n = Math.ceil(1500 / frameMs); i < n; i++) {
-    await sendFrame(silentBuf);
-  }
-
-  // SPEECH frames paced at 20ms
-  for (const f of frames) {
-    await sendFrame(f.buf);
-  }
-
-  // quick RMS sanity on the last speech frame
+  // (Optional) quick RMS on the last *non-silent* frame for sanity
   try {
-    const last = frames[frames.length - 1];
-    if (last?.buf?.byteLength) {
-      const i16 = new Int16Array(last.buf.buffer, last.buf.byteOffset, last.buf.byteLength / 2);
+    const lastAudio = frames[frames.length - 1];
+    if (lastAudio?.buf?.byteLength) {
+      const i16 = new Int16Array(lastAudio.buf.buffer, lastAudio.buf.byteOffset, lastAudio.buf.byteLength / 2);
       let sum = 0;
-      for (let i = 0; i < i16.length; i++) { const v = i16[i] / 32768; sum += v * v; }
-      const rms = Math.sqrt(sum / i16.length);
-      console.log("Last-frame RMS (0..1):", rms.toFixed(4));
+      for (let k = 0; k < i16.length; k++) { const v = i16[k] / 32768; sum += v * v; }
+      console.log("RMS(last audio frame):", Math.sqrt(sum / i16.length).toFixed(4));
     }
   } catch {}
 
-  // TAIL silence (3000ms) paced at 20ms
-  for (let i = 0, n = Math.ceil(3000 / frameMs); i < n; i++) {
-    await sendFrame(silentBuf);
+  // Unpublish (use the simplest signature to avoid proto option issues)
+  try {
+    await room.localParticipant.unpublishTrack(track);
+  } catch (e) {
+    console.warn("unpublishTrack warn:", e?.message || e);
   }
 
-  await safeUnpublish(room, publication, track);
-  try { if (typeof track.stop === "function") track.stop(); } catch {}
-  try { if (typeof source.stop === "function") source.stop(); } catch {}
+  try { track.stop?.(); } catch {}
+  try { source.stop?.(); } catch {}
 }
 
 async function speakTextIntoRoom(roomOrName, text, opts = {}) {
@@ -746,4 +756,3 @@ app.get("/diag/tts.wav", async (req, res) => {
 // ── START ─────────────────────────────────────────────────────────────────────
 const port = process.env.PORT || 8080;
 app.listen(port, () => console.log(`avatarbot_service listening on ${port}`));
-
