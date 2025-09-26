@@ -370,6 +370,10 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   const track = LocalAudioTrack.createAudioTrack(trackName, source);
   const options = new TrackPublishOptions();
   options.source = TrackSource.SOURCE_MICROPHONE;
+  // Improve Opus quality for synthetic TTS
+  options.dtx = false;          // keep encoder active during quiet bits
+  options.red = true;           // enable redundancy (fewer PLC artifacts)
+  options.audioBitrate = 32000; // try 24_000..48_000; 32 kbps is a good start
 
   const publication = await room.localParticipant.publishTrack(track, options);
 
