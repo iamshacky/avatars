@@ -358,7 +358,7 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
     samplesPerFrame,
   });
 
-  // Pace frames in real time (~20ms per frame)
+    // Pace frames in real time (~20ms per frame)
   const t0 = Date.now();
   let i = 0;
   for (const item of playlist) {
