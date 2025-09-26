@@ -314,21 +314,38 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
 
   for (let offset = 0; offset < i16_48k.length; offset += samplesPerFrame) {
     const remain = Math.min(samplesPerFrame, i16_48k.length - offset);
-    let block;
+    // Slice (or pad) into a plain Int16Array view first
+    let view;
     if (remain === samplesPerFrame) {
-      block = i16_48k.subarray(offset, offset + samplesPerFrame);
+      view = i16_48k.subarray(offset, offset + samplesPerFrame);
     } else {
-      block = new Int16Array(samplesPerFrame);
-      block.set(i16_48k.subarray(offset, offset + remain), 0);
+      const pad = new Int16Array(samplesPerFrame);
+      pad.set(i16_48k.subarray(offset, offset + remain), 0);
+      view = pad;
     }
+
+    // 🚫 Avoid Buffer.from(ArrayBuffer, ...) aliasing.
+    // ✅ Materialize bytes explicitly in little-endian:
+    const buf = Buffer.allocUnsafe(view.length * 2);
+    for (let i = 0; i < view.length; i++) {
+      buf.writeInt16LE(view[i], i * 2);
+    }
+
+    // Debug: peek mid frame once
+    if (offset === samplesPerFrame * Math.floor((i16_48k.length / samplesPerFrame) * 0.4)) {
+      const peek0 = buf.readInt16LE(0);
+      const peek1 = buf.readInt16LE(2);
+      const peek2 = buf.readInt16LE(4);
+      console.log("[frame peek]", { peek0, peek1, peek2 });
+    }
+
     frames.push({
-      buf: Buffer.from(block.buffer, block.byteOffset, block.byteLength),
+      buf,
       sampleRate: rate,
       samplesPerChannel: samplesPerFrame,
-      numChannels: 1
+      numChannels: 1,
     });
   }
-
   return { frames, sampleRate: rate, channels: 1 };
 }
 
