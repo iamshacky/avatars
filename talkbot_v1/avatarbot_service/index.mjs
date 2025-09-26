@@ -253,16 +253,45 @@ function toMonoInt16({ audioFormat, numChannels, bitsPerSample, dataBuf }) {
 function resampleTo48kInt16(srcI16, srcRate) {
   const dstRate = 48000;
   if (srcRate === dstRate) return srcI16;
+
   const ratio = dstRate / srcRate;
   const dstLen = Math.max(1, Math.round(srcI16.length * ratio));
   const out = new Int16Array(dstLen);
+
+  // Cubic Hermite interpolation (4-point). Safer than linear for sibilants.
+  const read = (i) => {
+    // clamp
+    if (i < 0) return srcI16[0];
+    if (i >= srcI16.length) return srcI16[srcI16.length - 1];
+    return srcI16[i];
+  };
+
   for (let i = 0; i < dstLen; i++) {
     const x = i / ratio;
-    const i0 = Math.floor(x);
-    const i1 = Math.min(i0 + 1, srcI16.length - 1);
-    const s0 = srcI16[i0];
-    const s1 = srcI16[i1];
-    out[i] = s0 + (s1 - s0) * (x - i0);
+    const i1 = Math.floor(x);
+    const t = x - i1;
+
+    const i0 = i1 - 1;
+    const i2 = i1 + 1;
+    const i3 = i1 + 2;
+
+    const y0 = read(i0);
+    const y1 = read(i1);
+    const y2 = read(i2);
+    const y3 = read(i3);
+
+    // Cubic Hermite basis
+    const a0 = -0.5*y0 + 1.5*y1 - 1.5*y2 + 0.5*y3;
+    const a1 = y0 - 2.5*y1 + 2*y2 - 0.5*y3;
+    const a2 = -0.5*y0 + 0.5*y2;
+    const a3 = y1;
+
+    let s = ((a0*t + a1)*t + a2)*t + a3;
+
+    // clamp to int16
+    if (s >  32767) s =  32767;
+    if (s < -32768) s = -32768;
+    out[i] = s | 0;
   }
   return out;
 }
@@ -356,7 +385,8 @@ async function ttsWavFromOpenAI(text) {
     model: OPENAI_TTS_MODEL,
     voice: OPENAI_TTS_VOICE,
     input: text,
-    response_format: "wav",
+    response_format: "pcm",
+    sample_rate: 48000,   // ⬅️ ask OpenAI for 48 kHz output
   });
   const wavBuf = Buffer.from(await resp.arrayBuffer());
   console.log("TTS ms:", Date.now() - t0, "bytes:", wavBuf?.length || 0);
@@ -373,7 +403,7 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   // Improve Opus quality for synthetic TTS
   options.dtx = false;          // keep encoder active during quiet bits
   options.red = true;           // enable redundancy (fewer PLC artifacts)
-  options.audioBitrate = 32000; // try 24_000..48_000; 32 kbps is a good start
+  options.audioBitrate = 48000; // try 24_000..48_000; 32 kbps is a good start
 
   const publication = await room.localParticipant.publishTrack(track, options);
 
