@@ -12,6 +12,4 @@ c/xampp/htdocs/project1/avatars
 | | |____public
 | | | |____index.html
 | | |____README.md
-| |____piper_service
-| | |____app.py
-| | |____Dockerfile
+| |____directory_tree.txt

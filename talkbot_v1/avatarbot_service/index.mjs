@@ -274,6 +274,23 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
   const monoI16 = toMonoInt16(meta);
   const i16_48k = resampleTo48kInt16(monoI16, meta.sampleRate);
 
+  // Normalize gain to ~0.8 peak
+  let peak = 0;
+  for (let i = 0; i < i16_48k.length; i++) {
+    const v = Math.abs(i16_48k[i]);
+    if (v > peak) peak = v;
+  }
+  if (peak > 0 && peak < 5000) { // only boost if it's really quiet
+    const scale = 0x6666 /* ~0.8 * 32767 */ / peak;
+    for (let i = 0; i < i16_48k.length; i++) {
+      let s = i16_48k[i] * scale;
+      // clamp
+      if (s >  32767) s =  32767;
+      if (s < -32768) s = -32768;
+      i16_48k[i] = s | 0;
+    }
+  }
+
   // 20ms framing with padding
   const rate = 48000;
   const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000); // 960
@@ -364,7 +381,12 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   for (const item of playlist) {
     // ⬇️ IMPORTANT: use the *actual* per-item sample count
     const spp = item.samplesPerChannel;           // was: samplesPerFrame
+    /*
     const frame = new AudioFrame(item.buf, sampleRate, 1, spp);
+    await source.captureFrame(frame);
+    */
+    const BYTES_PER_SAMPLE = 2;
+    const frame = new AudioFrame(item.buf, sampleRate, 1, spp, BYTES_PER_SAMPLE);
     await source.captureFrame(frame);
 
     // realtime pacing
