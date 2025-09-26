@@ -459,10 +459,12 @@ async function ttsWavFromOpenAI(text) {
     model: OPENAI_TTS_MODEL,
     voice: OPENAI_TTS_VOICE,
     input: text,
-    response_format: fmt,
+    response_format: wav,
   };
+  /*
   if (fmt === "pcm") args.sample_rate = 48000;   // ask for 48k PCM
   else args.sample_rate = 48000;                  // many SDKs also honor this for WAV
+  */
 
   const resp = await openai.audio.speech.create(args);
 
