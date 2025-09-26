@@ -362,15 +362,15 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   const t0 = Date.now();
   let i = 0;
   for (const item of playlist) {
-    const frame = new AudioFrame(item.buf, sampleRate, 1, samplesPerFrame);
+    // ⬇️ IMPORTANT: use the *actual* per-item sample count
+    const spp = item.samplesPerChannel;           // was: samplesPerFrame
+    const frame = new AudioFrame(item.buf, sampleRate, 1, spp);
     await source.captureFrame(frame);
 
     // realtime pacing
     const target = t0 + (++i * frameMs);
     const wait = target - Date.now();
-    if (wait > 0) {
-      await new Promise((r) => setTimeout(r, wait));
-    }
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   }
 
   // (Optional) quick RMS on the last *non-silent* frame for sanity
