@@ -294,6 +294,11 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
     }
   })(i16_48k);
 
+  console.log("[normalize] post-peak check (0..32767):", (function(i16){
+    let p = 0; for (let i = 0; i < i16.length; i++) { const v = Math.abs(i16[i]); if (v > p) p = v; }
+    return p;
+  })(i16_48k));
+
   // 20ms framing with padding
   const rate = 48000;
   const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000); // 960
@@ -383,11 +388,8 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
   let i = 0;
   for (const item of playlist) {
     // ⬇️ IMPORTANT: use the *actual* per-item sample count
-    const spp = item.samplesPerChannel;           // was: samplesPerFrame
-    /*
-    const frame = new AudioFrame(item.buf, sampleRate, 1, spp);
-    await source.captureFrame(frame);
-    */
+    const spp = item.samplesPerChannel;
+
     const BYTES_PER_SAMPLE = 2;
     const frame = new AudioFrame(item.buf, sampleRate, 1, spp, BYTES_PER_SAMPLE);
     await source.captureFrame(frame);
@@ -646,7 +648,7 @@ app.post("/diag/tone", async (req, res) => {
         t += phaseInc;
       }
       const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-      const frame = new AudioFrame(buf, rate, 1, samplesPerFrame);
+      const frame = new AudioFrame(buf, rate, 1, samplesPerFrame, 2);
       await source.captureFrame(frame);
     }
 
@@ -694,7 +696,7 @@ app.post("/diag/tone_hold", async (req, res) => {
           t += phaseInc;
         }
         const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-        const frame = new AudioFrame(buf, rate, 1, samplesPerFrame);
+        const frame = new AudioFrame(buf, rate, 1, samplesPerFrame, 2);
         await source.captureFrame(frame);
       }
     })();
@@ -742,7 +744,7 @@ app.post("/diag/silence_hold", async (req, res) => {
       while (running) {
         const pcm = new Int16Array(samplesPerFrame);
         const buf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-        const frame = new AudioFrame(buf, rate, 1, samplesPerFrame);
+        const frame = new AudioFrame(buf, rate, 1, samplesPerFrame, 2);
         await source.captureFrame(frame);
       }
     })();
