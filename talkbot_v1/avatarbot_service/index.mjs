@@ -274,22 +274,25 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
   const monoI16 = toMonoInt16(meta);
   const i16_48k = resampleTo48kInt16(monoI16, meta.sampleRate);
 
-  // Normalize gain to ~0.8 peak
-  let peak = 0;
-  for (let i = 0; i < i16_48k.length; i++) {
-    const v = Math.abs(i16_48k[i]);
-    if (v > peak) peak = v;
-  }
-  if (peak > 0 && peak < 5000) { // only boost if it's really quiet
-    const scale = 0x6666 /* ~0.8 * 32767 */ / peak;
-    for (let i = 0; i < i16_48k.length; i++) {
-      let s = i16_48k[i] * scale;
-      // clamp
-      if (s >  32767) s =  32767;
-      if (s < -32768) s = -32768;
-      i16_48k[i] = s | 0;
+  // Normalize gain to ~0.8 full-scale if too quiet
+  (function normalize(i16) {
+    let peak = 0;
+    for (let i = 0; i < i16.length; i++) {
+      const v = Math.abs(i16[i]);
+      if (v > peak) peak = v;
     }
-  }
+    // Only boost if really quiet (tweak threshold as you like)
+    if (peak > 0 && peak < 12000) { // ~ -8 dBFS peak
+      const target = 0.8 * 32767;   // ~ -1.9 dBFS
+      const scale = target / peak;
+      for (let i = 0; i < i16.length; i++) {
+        let s = i16[i] * scale;
+        if (s >  32767) s =  32767;
+        if (s < -32768) s = -32768;
+        i16[i] = s | 0;
+      }
+    }
+  })(i16_48k);
 
   // 20ms framing with padding
   const rate = 48000;
@@ -395,18 +398,21 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   }
 
-  // (Optional) quick RMS on the last *non-silent* frame for sanity
+  // (Optional) RMS on a mid-clip frame (avoid padded tail)
   try {
-    const lastAudio = frames[frames.length - 1];
-    if (lastAudio?.buf?.byteLength) {
-      const i16 = new Int16Array(lastAudio.buf.buffer, lastAudio.buf.byteOffset, lastAudio.buf.byteLength / 2);
+    const mid = Math.floor(frames.length * 0.4) | 0;
+    const test = frames[Math.max(0, Math.min(frames.length - 1, mid))];
+    if (test?.buf?.byteLength) {
+      const i16 = new Int16Array(test.buf.buffer, test.buf.byteOffset, test.buf.byteLength / 2);
       let sum = 0;
       for (let k = 0; k < i16.length; k++) { const v = i16[k] / 32768; sum += v * v; }
-      console.log("RMS(last audio frame):", Math.sqrt(sum / i16.length).toFixed(4));
+      console.log("RMS(mid audio frame):", Math.sqrt(sum / i16.length).toFixed(4));
     }
   } catch {}
 
   // Unpublish (use the simplest signature to avoid proto option issues)
+  // Give SFU/clients ~250ms to flush jitter buffer before unpublishing
+  await new Promise(r => setTimeout(r, 250));
   try {
     await room.localParticipant.unpublishTrack(track);
   } catch (e) {
