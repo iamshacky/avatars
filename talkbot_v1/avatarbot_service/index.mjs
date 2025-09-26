@@ -156,6 +156,79 @@ async function safeUnpublish(room, publication, track) {
   console.warn("unpublishTrack: all signatures failed; continuing", lastErr?.message || lastErr);
 }
 
+async function pcm48ToInt16Frames(pcmBuf48, desiredFrameMs = 20) {
+  // pcmBuf48 is raw mono little-endian int16 @ 48 kHz
+  if (!pcmBuf48 || pcmBuf48.length === 0) {
+    throw new Error("PCM buffer empty");
+  }
+  // Interpret as Int16 samples
+  const i16_48k = new Int16Array(pcmBuf48.buffer, pcmBuf48.byteOffset, pcmBuf48.byteLength / 2);
+
+  // (Optional) normalization — reuse your existing block as-is:
+  (function normalize(i16) {
+    let peak = 0;
+    for (let i = 0; i < i16.length; i++) {
+      const v = Math.abs(i16[i]);
+      if (v > peak) peak = v;
+    }
+    if (peak > 0 && peak < 12000) {
+      const target = 0.8 * 32767;
+      const scale = target / peak;
+      for (let i = 0; i < i16.length; i++) {
+        let s = i16[i] * scale;
+        if (s >  32767) s =  32767;
+        if (s < -32768) s = -32768;
+        i16[i] = s | 0;
+      }
+    }
+  })(i16_48k);
+
+  const rate = 48000;
+  const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000); // 960
+  const frames = [];
+
+  for (let offset = 0; offset < i16_48k.length; offset += samplesPerFrame) {
+    const remain = Math.min(samplesPerFrame, i16_48k.length - offset);
+    let view;
+    if (remain === samplesPerFrame) {
+      view = i16_48k.subarray(offset, offset + samplesPerFrame);
+    } else {
+      const pad = new Int16Array(samplesPerFrame);
+      pad.set(i16_48k.subarray(offset, offset + remain), 0);
+      view = pad;
+    }
+
+    const buf = Buffer.allocUnsafe(view.length * 2);
+    for (let i = 0; i < view.length; i++) buf.writeInt16LE(view[i], i * 2);
+
+    frames.push({ buf, sampleRate: rate, samplesPerChannel: samplesPerFrame, numChannels: 1 });
+  }
+  return { frames, sampleRate: rate, channels: 1 };
+}
+
+function wrapPcm16AsWav(pcmBuf, sampleRate = 48000, numChannels = 1) {
+  const byteRate = sampleRate * numChannels * 2;
+  const blockAlign = numChannels * 2;
+  const dataSize = pcmBuf.length;
+  const riffSize = 36 + dataSize;
+
+  const header = Buffer.allocUnsafe(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(riffSize, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);          // PCM header size
+  header.writeUInt16LE(1, 20);           // format = PCM
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(16, 34);          // bits per sample
+  header.write('data', 36);
+  header.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([header, pcmBuf]);
+}
+
 function parseWav(buf) {
   // Minimal RIFF/WAVE parser with chunk walk & clamping
   if (buf.length < 44) throw new Error("WAV too short");
@@ -381,13 +454,18 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
 // ── TTS (OpenAI) ─────────────────────────────────────────────────────────────
 async function ttsWavFromOpenAI(text) {
   const t0 = Date.now();
-  const resp = await openai.audio.speech.create({
+  const fmt = process.env.OPENAI_TTS_FORMAT || "pcm"; // "pcm" or "wav"
+  const args = {
     model: OPENAI_TTS_MODEL,
     voice: OPENAI_TTS_VOICE,
     input: text,
-    response_format: "pcm",
-    sample_rate: 48000,   // ⬅️ ask OpenAI for 48 kHz output
-  });
+    response_format: fmt,
+  };
+  if (fmt === "pcm") args.sample_rate = 48000;   // ask for 48k PCM
+  else args.sample_rate = 48000;                  // many SDKs also honor this for WAV
+
+  const resp = await openai.audio.speech.create(args);
+
   const wavBuf = Buffer.from(await resp.arrayBuffer());
   console.log("TTS ms:", Date.now() - t0, "bytes:", wavBuf?.length || 0);
   if (!wavBuf || wavBuf.length < 44) throw new Error("TTS returned empty/invalid WAV");
@@ -494,7 +572,18 @@ async function speakTextIntoRoom(roomOrName, text, opts = {}) {
       console.log("[tts header]", tag);
     } catch {}
     console.log("[speakTextIntoRoom] got wavBuf len:", wavBuf.length);
-    const { frames, sampleRate } = await wavToInt16Frames(wavBuf, 20);
+    
+    let frames, sampleRate;
+    const isRIFF = wavBuf.length >= 12
+      && wavBuf.toString('ascii', 0, 4) === 'RIFF'
+      && wavBuf.toString('ascii', 8, 12) === 'WAVE';
+
+    if (isRIFF) {
+      ({ frames, sampleRate } = await wavToInt16Frames(wavBuf, 20));
+    } else {
+      ({ frames, sampleRate } = await pcm48ToInt16Frames(wavBuf, 20)); // raw PCM @ 48k
+    }
+
     console.log("[speakTextIntoRoom] got frames:", frames.length, "sr:", sampleRate);
 
     let room = typeof roomOrName === "string"
@@ -833,8 +922,13 @@ app.post("/diag/silence_hold", async (req, res) => {
 app.get("/diag/tts.wav", async (req, res) => {
   try {
     const text = String(req.query.text || "This is a test.");
-    const wavBuf = await ttsWavFromOpenAI(text);
-    res.type("audio/wav").send(wavBuf);
+    const buf = await ttsWavFromOpenAI(text);
+    // Detect if buf is already WAV; if not, wrap as WAV
+    const isRIFF = buf.length >= 12
+      && buf.toString('ascii', 0, 4) === 'RIFF'
+      && buf.toString('ascii', 8, 12) === 'WAVE';
+    const out = isRIFF ? buf : wrapPcm16AsWav(buf, 48000, 1);
+    res.type("audio/wav").send(out);
   } catch (e) {
     console.error("diag/tts.wav error:", e);
     res.status(500).json({ ok: false, error: String(e) });
