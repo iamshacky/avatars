@@ -454,27 +454,18 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
 // ── TTS (OpenAI) ─────────────────────────────────────────────────────────────
 async function ttsWavFromOpenAI(text) {
   const t0 = Date.now();
-  const fmt = process.env.OPENAI_TTS_FORMAT || "pcm"; // "pcm" or "wav"
-  const args = {
-    model: OPENAI_TTS_MODEL,
-    voice: OPENAI_TTS_VOICE,
-    input: text,
-    response_format: "wav",   // <-- fix: string literal, not variable
-  };
-  /*
-  if (fmt === "pcm") args.sample_rate = 48000;   // ask for 48k PCM
-  else args.sample_rate = 48000;                  // many SDKs also honor this for WAV
-  */
   const resp = await openai.audio.speech.create({
     model: OPENAI_TTS_MODEL,
     voice: OPENAI_TTS_VOICE,
     input: text,
-    response_format: "pcm",  // <-- ask for raw PCM
-    sample_rate: 48000       // <-- at the rate LiveKit wants
+    response_format: "wav", // always ask for WAV here
   });
 
-  console.log("TTS ms:", Date.now() - t0, "bytes:", wavBuf?.length || 0);
-  if (!wavBuf || wavBuf.length < 44) throw new Error("TTS returned empty/invalid WAV");
+  const wavBuf = Buffer.from(await resp.arrayBuffer());
+  console.log("TTS ms:", Date.now() - t0, "bytes:", wavBuf.length);
+  if (!wavBuf || wavBuf.length < 44) {
+    throw new Error("TTS returned empty/invalid WAV");
+  }
   return wavBuf;
 }
 
