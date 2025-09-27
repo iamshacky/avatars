@@ -58,6 +58,13 @@ app.get("/__debug/files", (_req, res) => {
   res.json({ __dirname, pubDir, exists, listing });
 });
 
+function saveToPublicTemp(buf, ext = "wav") {
+  const fname = `tts-${Date.now()}-${Math.random().toString(36).slice(2,8)}.${ext}`;
+  const outPath = path.join(pubDir, fname);
+  fs.writeFileSync(outPath, buf);
+  return "/" + fname; // URL the browser can fetch
+}
+
 // 🔐 optional shared-secret guard
 app.use((req, res, next) => {
   const needsAuth =
@@ -408,11 +415,12 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
 // ── TTS (OpenAI) ─────────────────────────────────────────────────────────────
 async function ttsWavFromOpenAI(text) {
   const t0 = Date.now();
+  // Match the quality you liked from /diag/tts.wav (24k mono WAV).
   const resp = await openai.audio.speech.create({
-    model: OPENAI_TTS_MODEL,     // e.g. "gpt-4o-mini-tts"
-    voice: OPENAI_TTS_VOICE,     // e.g. "alloy"
-    response_format: "wav",      // ask for WAV
-    sample_rate: 48000,          // 48 kHz to match Opus/LiveKit
+    model: OPENAI_TTS_MODEL,
+    voice: OPENAI_TTS_VOICE,
+    response_format: "wav",
+    sample_rate: 24000, // 24k sounds like your good sample
     input: text,
   });
   const wavBuf = Buffer.from(await resp.arrayBuffer());
@@ -591,48 +599,24 @@ app.post("/leave", async (_req, res) => {
 app.post("/message", async (req, res) => {
   const roomName = req.body?.roomName || DEFAULT_ROOM;
   const textIn = String(req.body?.text || "").trim();
-  const keep = req.body?.keep;
   if (!textIn) return res.status(400).json({ ok: false, error: "text required" });
 
-  const mode = keep === true || keep === false
-    ? (keep ? "PERSISTENT" : "TRANSIENT")
-    : (process.env.BOT_MODE || BOT_MODE);
-
+  // We still compute a reply and make sure the avatar is present in the room,
+  // but we won't publish any audio via LiveKit.
   try {
     const t0 = Date.now();
     const reply = await llmReply(textIn);
     console.log("LLM ms:", Date.now() - t0);
 
-    // enqueue the speak so HTTP returns immediately (no 502s)
-    const roomName0 = roomName;
-    if (mode === "PERSISTENT") {
-      enqueueSpeak(async () => {
-        const room = await ensurePersistentRoom(roomName0);
-        console.log("PERSISTENT speak starting, identity:", room.localParticipant?.identity);
-        await speakTextIntoRoom(room, reply, { roomName: roomName0, identity: room.localParticipant?.identity });
-        console.log("PERSISTENT speak done, identity:", room.localParticipant?.identity);
-      });
-    } else {
-      // TRANSIENT: unique identity, serialize, and keep room up a tad longer
-      const transientIdentity = `${BOT_IDENTITY}-t-${Math.random().toString(36).slice(2, 6)}`;
-      console.log("TRANSIENT speak queued, identity:", transientIdentity);
+    // Ensure the avatar is "in the room" (presence) but stay muted: publish nothing.
+    await ensurePersistentRoom(roomName);
 
-      enqueueSpeak(async () => {
-        const room = await connectToRoom(roomName0, transientIdentity);
-        try {
-          console.log("TRANSIENT speak starting, identity:", room.localParticipant?.identity);
-          await speakTextIntoRoom(room, reply, { roomName: roomName0, identity: transientIdentity });
-          console.log("TRANSIENT speak done, identity:", room.localParticipant?.identity);
-          // keep the participant around briefly so late subscribers attach
-          await new Promise((r) => setTimeout(r, 2000)); // was 800ms
-        } finally {
-          await room.disconnect().catch(() => {});
-        }
-      });
-    }
+    // Generate high-quality TTS and save it under /public
+    const wavBuf = await ttsWavFromOpenAI(reply);
+    const audioUrl = saveToPublicTemp(wavBuf, "wav");
 
-    // respond right away
-    return res.json({ ok: true, reply, mode });
+    // Return URL so the browser can play it directly
+    return res.json({ ok: true, reply, audioUrl, mode: "NO_LK_AUDIO" });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false, error: String(e) });

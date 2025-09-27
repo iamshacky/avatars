@@ -152,13 +152,28 @@
       } catch (e) { console.error(e); alert(e.message); }
     };
 
-    document.getElementById("speakOnce").onclick = async () => {
-      try {
-        const roomName = roomInput.value || "default";
-        const text = document.getElementById("msg").value || "Hello from AvatarBot_1!";
-        const res = await postJSON("/message", { roomName, text, keep: false });
-        console.log("speakOnce ok", res);
-      } catch (e) { console.error(e); alert(e.message); }
+    document.getElementById('speakOnce').onclick = async () => {
+      const text = (document.getElementById('prompt')?.value || "Say hi!");
+      const roomName = "default";
+
+      const r = await fetch("/message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, roomName })
+      });
+      const data = await r.json();
+      console.log("speakOnce ok", data);
+
+      // Play the natural TTS straight in the browser
+      if (data?.audioUrl) {
+        const audio = new Audio(data.audioUrl);
+        try {
+          await audio.play();
+          console.log("[audio] playing from", data.audioUrl);
+        } catch (err) {
+          console.warn("Audio play failed (user gesture / permissions?)", err);
+        }
+      }
     };
 
     document.getElementById("stayJoin").onclick = async () => {
