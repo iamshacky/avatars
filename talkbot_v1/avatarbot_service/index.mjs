@@ -381,29 +381,12 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
     bytes: meta.dataBuf?.length
   });
 
-  // 1) Decode to mono Int16, but DO NOT resample.
+  // Decode to mono Int16, no resampling
   const i16 = toMonoInt16(meta);
-  const rate = meta.sampleRate;                 // <-- keep native (e.g., 24000)
+  const rate = meta.sampleRate; // expect 48000 from the request above
   const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000);
 
-  // Optional: gentle peak-normalize if very quiet
-  (function normalize(i) {
-    let peak = 0;
-    for (let n = 0; n < i.length; n++) {
-      const v = Math.abs(i[n]);
-      if (v > peak) peak = v;
-    }
-    if (peak > 0 && peak < 12000) {
-      const target = 0.8 * 32767;
-      const scale = target / peak;
-      for (let n = 0; n < i.length; n++) {
-        let s = i[n] * scale;
-        if (s >  32767) s =  32767;
-        if (s < -32768) s = -32768;
-        i[n] = s | 0;
-      }
-    }
-  })(i16);
+  // No normalization: it can create pumping/harshness on synthetic voices.
 
   const frames = [];
   for (let offset = 0; offset < i16.length; offset += samplesPerFrame) {
@@ -416,8 +399,6 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
       pad.set(i16.subarray(offset, offset + remain), 0);
       view = pad;
     }
-
-    // materialize little-endian bytes
     const buf = Buffer.allocUnsafe(view.length * 2);
     for (let k = 0; k < view.length; k++) buf.writeInt16LE(view[k], k * 2);
 
@@ -435,56 +416,49 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
 async function ttsWavFromOpenAI(text) {
   const t0 = Date.now();
   const resp = await openai.audio.speech.create({
-    model: OPENAI_TTS_MODEL,
-    voice: OPENAI_TTS_VOICE,
+    model: OPENAI_TTS_MODEL,     // e.g. "gpt-4o-mini-tts"
+    voice: OPENAI_TTS_VOICE,     // e.g. "alloy"
+    response_format: "wav",      // ask for WAV
+    sample_rate: 48000,          // 48 kHz to match Opus/LiveKit
     input: text,
-    response_format: "wav", // always ask for WAV here
   });
-
   const wavBuf = Buffer.from(await resp.arrayBuffer());
-  console.log("TTS ms:", Date.now() - t0, "bytes:", wavBuf.length);
-  if (!wavBuf || wavBuf.length < 44) {
-    throw new Error("TTS returned empty/invalid WAV");
-  }
+  console.log("TTS ms:", Date.now() - t0, "bytes:", wavBuf?.length || 0);
+  if (!wavBuf || wavBuf.length < 44) throw new Error("TTS returned empty/invalid WAV");
   return wavBuf;
 }
 
 // ── SPEAK: TTS → PUBLISH → pre-roll → tail → UNPUBLISH ───────────────────────
 async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-audio") {
-  const source = new AudioSource(sampleRate, 1);    // <-- uses native rate
+  const source = new AudioSource(sampleRate, 1);
   const track = LocalAudioTrack.createAudioTrack(trackName, source);
   const options = new TrackPublishOptions();
   options.source = TrackSource.SOURCE_MICROPHONE;
   options.dtx = false;
   options.red = true;
-  options.audioBitrate = 48000; // this is fine
+  options.audioBitrate = 48000;
 
   await room.localParticipant.publishTrack(track, options);
 
-  // derive frame pacing from sampleRate (not hard-coded 48k)
+  await new Promise((r) => setTimeout(r, 150)); // small pre-roll
+
   const frameMs = 20;
-  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000);
+  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000);  // <-- derived, not 960 hard-coded
 
-  // Build a playlist: short pre-roll silence → actual TTS frames → short tail
-  const preMs = 400;   // try 200–600ms if you like
-  const tailMs = 600;  // try 400–1000ms if you like
-
-  const silentBlock = new Int16Array(samplesPerFrame);
-  const silentBuf = Buffer.from(silentBlock.buffer, silentBlock.byteOffset, silentBlock.byteLength);
-
-  // Wrap frames into a uniform descriptor
+  // minimal pre/post padding
+  const prePadFrames = 8;   // ~160 ms
+  const postPadFrames = 8;  // ~160 ms
+  const silent = Buffer.alloc(samplesPerFrame * 2); // int16 stereo? mono: 2 bytes/sample
   const playlist = [];
 
-  for (let i = 0; i < Math.ceil(preMs / frameMs); i++) {
-    playlist.push({ buf: silentBuf, samplesPerChannel: samplesPerFrame, silent: true });
+  for (let i = 0; i < prePadFrames; i++) {
+    playlist.push({ buf: silent, samplesPerChannel: samplesPerFrame });
   }
-
   for (const f of frames) {
-    playlist.push({ buf: f.buf, samplesPerChannel: f.samplesPerChannel, silent: false });
+    playlist.push({ buf: f.buf, samplesPerChannel: samplesPerFrame });
   }
-
-  for (let i = 0; i < Math.ceil(tailMs / frameMs); i++) {
-    playlist.push({ buf: silentBuf, samplesPerChannel: samplesPerFrame, silent: true });
+  for (let i = 0; i < postPadFrames; i++) {
+    playlist.push({ buf: silent, samplesPerChannel: samplesPerFrame });
   }
 
   console.log("About to publish frames", {
@@ -494,44 +468,23 @@ async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-a
     samplesPerFrame,
   });
 
-    // Pace frames in real time (~20ms per frame)
   const t0 = Date.now();
   let i = 0;
   for (const item of playlist) {
-    // ⬇️ IMPORTANT: use the *actual* per-item sample count
     const spp = item.samplesPerChannel;
 
-    const BYTES_PER_SAMPLE = 2;
-    const frame = new AudioFrame(item.buf, sampleRate, 1, spp, BYTES_PER_SAMPLE);
+    // IMPORTANT: 4-arg ctor (buffer, sampleRate, channels, samplesPerChannel)
+    const frame = new AudioFrame(item.buf, sampleRate, 1, spp);   // <-- 4 args only
     await source.captureFrame(frame);
 
-    // realtime pacing
+    // 20ms pacing
     const target = t0 + (++i * frameMs);
     const wait = target - Date.now();
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   }
 
-  // (Optional) RMS on a mid-clip frame (avoid padded tail)
-  try {
-    const mid = Math.floor(frames.length * 0.4) | 0;
-    const test = frames[Math.max(0, Math.min(frames.length - 1, mid))];
-    if (test?.buf?.byteLength) {
-      const i16 = new Int16Array(test.buf.buffer, test.buf.byteOffset, test.buf.byteLength / 2);
-      let sum = 0;
-      for (let k = 0; k < i16.length; k++) { const v = i16[k] / 32768; sum += v * v; }
-      console.log("RMS(mid audio frame):", Math.sqrt(sum / i16.length).toFixed(4));
-    }
-  } catch {}
-
-  // Unpublish (use the simplest signature to avoid proto option issues)
-  // Give SFU/clients ~250ms to flush jitter buffer before unpublishing
-  await new Promise(r => setTimeout(r, 250));
-  try {
-    await room.localParticipant.unpublishTrack(track);
-  } catch (e) {
-    console.warn("unpublishTrack warn:", e?.message || e);
-  }
-
+  await new Promise((r) => setTimeout(r, 200));
+  try { await room.localParticipant.unpublishTrack(track); } catch {}
   try { track.stop?.(); } catch {}
   try { source.stop?.(); } catch {}
 }
