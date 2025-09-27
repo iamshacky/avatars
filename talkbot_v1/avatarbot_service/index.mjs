@@ -465,10 +465,14 @@ async function ttsWavFromOpenAI(text) {
   if (fmt === "pcm") args.sample_rate = 48000;   // ask for 48k PCM
   else args.sample_rate = 48000;                  // many SDKs also honor this for WAV
   */
+  const resp = await openai.audio.speech.create({
+    model: OPENAI_TTS_MODEL,
+    voice: OPENAI_TTS_VOICE,
+    input: text,
+    response_format: "pcm",  // <-- ask for raw PCM
+    sample_rate: 48000       // <-- at the rate LiveKit wants
+  });
 
-  const resp = await openai.audio.speech.create(args);
-
-  const wavBuf = Buffer.from(await resp.arrayBuffer());
   console.log("TTS ms:", Date.now() - t0, "bytes:", wavBuf?.length || 0);
   if (!wavBuf || wavBuf.length < 44) throw new Error("TTS returned empty/invalid WAV");
   return wavBuf;
