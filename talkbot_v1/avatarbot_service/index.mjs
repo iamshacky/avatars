@@ -459,7 +459,7 @@ async function ttsWavFromOpenAI(text) {
     model: OPENAI_TTS_MODEL,
     voice: OPENAI_TTS_VOICE,
     input: text,
-    response_format: wav,
+    response_format: "wav",   // <-- fix: string literal, not variable
   };
   /*
   if (fmt === "pcm") args.sample_rate = 48000;   // ask for 48k PCM
