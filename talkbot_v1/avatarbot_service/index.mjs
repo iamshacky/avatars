@@ -381,65 +381,45 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
     bytes: meta.dataBuf?.length
   });
 
-  const monoI16 = toMonoInt16(meta);
-  const i16_48k = resampleTo48kInt16(monoI16, meta.sampleRate);
+  // 1) Decode to mono Int16, but DO NOT resample.
+  const i16 = toMonoInt16(meta);
+  const rate = meta.sampleRate;                 // <-- keep native (e.g., 24000)
+  const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000);
 
-  // Normalize gain to ~0.8 full-scale if too quiet
-  (function normalize(i16) {
+  // Optional: gentle peak-normalize if very quiet
+  (function normalize(i) {
     let peak = 0;
-    for (let i = 0; i < i16.length; i++) {
-      const v = Math.abs(i16[i]);
+    for (let n = 0; n < i.length; n++) {
+      const v = Math.abs(i[n]);
       if (v > peak) peak = v;
     }
-    // Only boost if really quiet (tweak threshold as you like)
-    if (peak > 0 && peak < 12000) { // ~ -8 dBFS peak
-      const target = 0.8 * 32767;   // ~ -1.9 dBFS
+    if (peak > 0 && peak < 12000) {
+      const target = 0.8 * 32767;
       const scale = target / peak;
-      for (let i = 0; i < i16.length; i++) {
-        let s = i16[i] * scale;
+      for (let n = 0; n < i.length; n++) {
+        let s = i[n] * scale;
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
-        i16[i] = s | 0;
+        i[n] = s | 0;
       }
     }
-  })(i16_48k);
+  })(i16);
 
-  console.log("[normalize] post-peak check (0..32767):", (function(i16){
-    let p = 0; for (let i = 0; i < i16.length; i++) { const v = Math.abs(i16[i]); if (v > p) p = v; }
-    return p;
-  })(i16_48k));
-
-  // 20ms framing with padding
-  const rate = 48000;
-  const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000); // 960
   const frames = [];
-
-  for (let offset = 0; offset < i16_48k.length; offset += samplesPerFrame) {
-    const remain = Math.min(samplesPerFrame, i16_48k.length - offset);
-    // Slice (or pad) into a plain Int16Array view first
+  for (let offset = 0; offset < i16.length; offset += samplesPerFrame) {
+    const remain = Math.min(samplesPerFrame, i16.length - offset);
     let view;
     if (remain === samplesPerFrame) {
-      view = i16_48k.subarray(offset, offset + samplesPerFrame);
+      view = i16.subarray(offset, offset + samplesPerFrame);
     } else {
       const pad = new Int16Array(samplesPerFrame);
-      pad.set(i16_48k.subarray(offset, offset + remain), 0);
+      pad.set(i16.subarray(offset, offset + remain), 0);
       view = pad;
     }
 
-    // 🚫 Avoid Buffer.from(ArrayBuffer, ...) aliasing.
-    // ✅ Materialize bytes explicitly in little-endian:
+    // materialize little-endian bytes
     const buf = Buffer.allocUnsafe(view.length * 2);
-    for (let i = 0; i < view.length; i++) {
-      buf.writeInt16LE(view[i], i * 2);
-    }
-
-    // Debug: peek mid frame once
-    if (offset === samplesPerFrame * Math.floor((i16_48k.length / samplesPerFrame) * 0.4)) {
-      const peek0 = buf.readInt16LE(0);
-      const peek1 = buf.readInt16LE(2);
-      const peek2 = buf.readInt16LE(4);
-      console.log("[frame peek]", { peek0, peek1, peek2 });
-    }
+    for (let k = 0; k < view.length; k++) buf.writeInt16LE(view[k], k * 2);
 
     frames.push({
       buf,
@@ -471,22 +451,19 @@ async function ttsWavFromOpenAI(text) {
 
 // ── SPEAK: TTS → PUBLISH → pre-roll → tail → UNPUBLISH ───────────────────────
 async function publishFramesOnce(room, frames, sampleRate, trackName = "avatar-audio") {
-  const source = new AudioSource(sampleRate, 1);
+  const source = new AudioSource(sampleRate, 1);    // <-- uses native rate
   const track = LocalAudioTrack.createAudioTrack(trackName, source);
   const options = new TrackPublishOptions();
   options.source = TrackSource.SOURCE_MICROPHONE;
-  // Improve Opus quality for synthetic TTS
-  options.dtx = false;          // keep encoder active during quiet bits
-  options.red = true;           // enable redundancy (fewer PLC artifacts)
-  options.audioBitrate = 48000; // try 24_000..48_000; 32 kbps is a good start
+  options.dtx = false;
+  options.red = true;
+  options.audioBitrate = 48000; // this is fine
 
-  const publication = await room.localParticipant.publishTrack(track, options);
+  await room.localParticipant.publishTrack(track, options);
 
-  // Small grace so SFU announces the track before audio starts
-  await new Promise((r) => setTimeout(r, 120));
-
+  // derive frame pacing from sampleRate (not hard-coded 48k)
   const frameMs = 20;
-  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000); // 960 @ 48k
+  const samplesPerFrame = Math.floor((sampleRate * frameMs) / 1000);
 
   // Build a playlist: short pre-roll silence → actual TTS frames → short tail
   const preMs = 400;   // try 200–600ms if you like
