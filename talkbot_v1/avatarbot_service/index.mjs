@@ -381,9 +381,16 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
     bytes: meta.dataBuf?.length
   });
 
-  // Decode to mono Int16, no resampling
-  const i16 = toMonoInt16(meta);
-  const rate = meta.sampleRate; // expect 48000 from the request above
+  // Decode to mono Int16
+  let i16 = toMonoInt16(meta);
+  let rate = meta.sampleRate;
+
+  // Resample to 48k if needed
+  if (rate !== 48000) {
+    i16 = resampleTo48kInt16(i16, rate);
+    rate = 48000;
+  }
+
   const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000);
 
   // No normalization: it can create pumping/harshness on synthetic voices.
