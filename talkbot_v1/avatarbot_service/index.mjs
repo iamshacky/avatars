@@ -382,19 +382,9 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
   });
 
   // Decode to mono Int16
-  let i16 = toMonoInt16(meta);
-  let rate = meta.sampleRate;
-
-  // Resample to 48k if needed
-  if (rate !== 48000) {
-    i16 = resampleTo48kInt16(i16, rate);
-    rate = 48000;
-  }
-
+  const i16 = toMonoInt16(meta);
+  const rate = meta.sampleRate;  // keep native (likely 24000)
   const samplesPerFrame = Math.floor((rate * desiredFrameMs) / 1000);
-
-  // No normalization: it can create pumping/harshness on synthetic voices.
-
   const frames = [];
   for (let offset = 0; offset < i16.length; offset += samplesPerFrame) {
     const remain = Math.min(samplesPerFrame, i16.length - offset);
@@ -407,14 +397,10 @@ async function wavToInt16Frames(wavBuf, desiredFrameMs = 20) {
       view = pad;
     }
     const buf = Buffer.allocUnsafe(view.length * 2);
-    for (let k = 0; k < view.length; k++) buf.writeInt16LE(view[k], k * 2);
-
-    frames.push({
-      buf,
-      sampleRate: rate,
-      samplesPerChannel: samplesPerFrame,
-      numChannels: 1,
-    });
+    for (let k = 0; k < view.length; k++) {
+      buf.writeInt16LE(view[k], k * 2);
+    }
+    frames.push({ buf, sampleRate: rate, samplesPerChannel: samplesPerFrame, numChannels: 1 });
   }
   return { frames, sampleRate: rate, channels: 1 };
 }
