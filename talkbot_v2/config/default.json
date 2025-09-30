@@ -1,0 +1,18 @@
+{
+  "tts": {
+    "defaultProvider": "openai",
+    "defaultVoice": "alloy",
+    "sampleRate": 24000,
+    "format": "mp3",
+    "enableStreaming": false
+  },
+  "llm": {
+    "defaultProvider": "openai",
+    "model": "gpt-4o-mini",
+    "temperature": 0.7
+  },
+  "avatar": {
+    "lipsyncMode": "energy",
+    "renderer": "2d"
+  }
+}
