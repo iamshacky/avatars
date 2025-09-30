@@ -1,0 +1,101 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Avatar (OpenAI TTS only)</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 24px auto; }
+  #face { width: 240px; height: 240px; border-radius: 50%; background: #eee;
+          display: grid; place-items: center; margin: 16px 0; }
+  #mouth { width: 80px; height: 12px; border-radius: 10px; background: #333;
+           transition: height 60ms; }
+  textarea, button, select, input { font-size: 16px; }
+</style>
+<body>
+  <h1>Avatar (OpenAI voice + lip-sync)</h1>
+
+  <div id="face"><div id="mouth"></div></div>
+  <audio id="avatar-audio" autoplay></audio>
+
+  <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+    <label>Voice:
+      <select id="voice">
+        <option>alloy</option>
+        <option>verse</option>
+        <option>aria</option>
+        <option>sage</option>
+        <!-- add voices you like -->
+      </select>
+    </label>
+    <label>Rate:
+      <select id="rate">
+        <option value="24000">24k</option>
+        <option value="48000">48k</option>
+      </select>
+    </label>
+    <label>Format:
+      <select id="fmt">
+        <option>wav</option>
+        <option>mp3</option>
+      </select>
+    </label>
+  </div>
+
+  <textarea id="text" rows="3" style="width:100%;margin:10px 0;">Hey! I’m a lightweight avatar powered by OpenAI.</textarea>
+  <div>
+    <button id="say">Speak</button>
+  </div>
+
+  <script type="module">
+    // Simple avatar player (audio + analyser → mouth)
+    const audioEl = document.getElementById('avatar-audio');
+    const mouthEl = document.getElementById('mouth');
+    const voiceEl = document.getElementById('voice');
+    const rateEl  = document.getElementById('rate');
+    const fmtEl   = document.getElementById('fmt');
+
+    // Web Audio
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AC();
+    const src = ctx.createMediaElementSource(audioEl);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    analyser.connect(ctx.destination); // you can skip this if you prefer
+
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    (function tick(){
+      analyser.getByteFrequencyData(data);
+      let level = 0;
+      for (let i = 0; i < data.length; i++) level += data[i];
+      level = level / data.length;
+      const h = 10 + Math.min(90, level / 2.5);
+      mouthEl.style.height = h + 'px';
+      requestAnimationFrame(tick);
+    })();
+
+    async function speak(text) {
+      const url = `/api/tts?` + new URLSearchParams({
+        text,
+        voice: voiceEl.value,
+        rate: rateEl.value,
+        fmt: fmtEl.value
+      });
+
+      try {
+        await ctx.resume(); // in case autoplay policies paused the context
+        audioEl.src = url;
+        await audioEl.play();
+      } catch (e) {
+        console.warn('play blocked:', e?.message || e);
+      }
+    }
+
+    document.getElementById('say').onclick = async () => {
+      const t = document.getElementById('text').value.trim();
+      if (!t) return;
+      await speak(t);
+    };
+
+    // optional: click anywhere to ensure audio can play
+    window.addEventListener('click', () => ctx.resume().catch(()=>{}), { once: true });
+  </script>
+</body>
